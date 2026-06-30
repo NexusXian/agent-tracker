@@ -72,7 +72,7 @@ func loadKeys() keyConfig {
 			continue
 		}
 		apply := func(field string, val string) {
-			v := strings.TrimSpace(val)
+			v := strings.ToLower(strings.TrimSpace(val))
 			if v == "" {
 				return
 			}
@@ -116,8 +116,10 @@ type model struct {
 	width      int
 	height     int
 	state      ipc.Envelope
-	cursor     int
-	err        string
+	cursor      int
+	scroll      int // top row of visible window
+	selKey      string
+	err         string
 	help       bool
 	noteMode   bool
 	noteInput  string
@@ -212,10 +214,14 @@ func (m *model) handleKey(key string) (tea.Model, tea.Cmd) {
 	case m.keys.Up, "up":
 		if m.cursor > 0 {
 			m.cursor--
+			m.updateSelKey()
+			m.scrollIntoView()
 		}
 	case m.keys.Down, "down":
 		if m.cursor < len(m.tasks())-1 {
 			m.cursor++
+			m.updateSelKey()
+			m.scrollIntoView()
 		}
 	case m.keys.Open:
 		return m, m.focusSelected()
@@ -312,27 +318,60 @@ func (m *model) selected() *ipc.Task {
 	return &t
 }
 
+func taskKey(t ipc.Task) string {
+	return t.SessionID + "|" + t.WindowID + "|" + t.Pane
+}
+
+func (m *model) updateSelKey() {
+	if t := m.selected(); t != nil {
+		m.selKey = taskKey(*t)
+	} else {
+		m.selKey = ""
+	}
+}
+
+func (m *model) scrollIntoView() {
+	tasks := m.tasks()
+	if len(tasks) == 0 {
+		m.scroll = 0
+		return
+	}
+	rowsPerPage := m.height - 6
+	if rowsPerPage < 1 {
+		rowsPerPage = 1
+	}
+	if m.cursor < m.scroll {
+		m.scroll = m.cursor
+	}
+	if m.cursor >= m.scroll+rowsPerPage {
+		m.scroll = m.cursor - rowsPerPage + 1
+	}
+	if m.scroll > len(tasks)-rowsPerPage {
+		m.scroll = len(tasks) - rowsPerPage
+	}
+	if m.scroll < 0 {
+		m.scroll = 0
+	}
+}
+
 func (m *model) clamp() {
-	if n := len(m.tasks()); m.cursor >= n {
-		m.cursor = n - 1
+	tasks := m.tasks()
+	if m.selKey != "" {
+		for i, t := range tasks {
+			if taskKey(t) == m.selKey {
+				m.cursor = i
+				m.scrollIntoView()
+				return
+			}
+		}
+	}
+	if m.cursor >= len(tasks) {
+		m.cursor = len(tasks) - 1
 	}
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
-}
-
-func isInPopup() bool {
-	// Most reliable: the tmux key-binding launches us with this env var set
-	// inside display-popup. (#{popup_id}/$TMUX_PANE are unreliable from a
-	// popup because display-message reports the underlying pane.)
-	if strings.TrimSpace(os.Getenv("AGENT_TRACKER_POPUP")) != "" {
-		return true
-	}
-	out, err := exec.Command("tmux", "display-message", "-p", "#{popup_id}").Output()
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(out)) != ""
+	m.scrollIntoView()
 }
 
 func (m *model) focusSelected() tea.Cmd {
@@ -344,9 +383,6 @@ func (m *model) focusSelected() tea.Cmd {
 		err := focusTask(*t)
 		if err != nil {
 			return cmdResultMsg{err: err}
-		}
-		if isInPopup() {
-			return tea.QuitMsg{}
 		}
 		return cmdResultMsg{}
 	}
@@ -480,7 +516,9 @@ func (m model) metricsLine() string {
 			}
 		}
 	}
-	return fmt.Sprintf("%d live  ·  %d review", active, review)
+	liveDot := styleLive.Render("●")
+	reviewDot := styleReview.Render("●")
+	return fmt.Sprintf("%s %d active  ·  %s %d review", liveDot, active, reviewDot, review)
 }
 
 func (m model) renderTasks(width int) string {
@@ -493,8 +531,8 @@ func (m model) renderTasks(width int) string {
 	if rowsPerPage < 1 {
 		rowsPerPage = 1
 	}
-	start := m.cursor
-	if start > len(tasks)-rowsPerPage && len(tasks) >= rowsPerPage {
+	start := m.scroll
+	if start > len(tasks)-rowsPerPage {
 		start = len(tasks) - rowsPerPage
 	}
 	if start < 0 {
@@ -542,16 +580,16 @@ func (m model) renderRow(t ipc.Task, selected bool, width int, now time.Time) st
 		segs = append(segs, sep("  /  "), metaSegment{text: w, style: styleMeta})
 	}
 	if cwd := displayCWD(t.CWD); cwd != "" {
-		segs = append(segs, sep("  ·  "), metaSegment{text: cwd, style: styleCWD})
+		segs = append(segs, sep("  · "), metaSegment{text: "~/", style: styleMeta}, metaSegment{text: cwd, style: styleCWD})
 	}
 	if branch := strings.TrimSpace(t.Branch); branch != "" {
-		segs = append(segs, sep("   "), metaSegment{text: branch, style: styleBranch})
+		segs = append(segs, sep("  "), metaSegment{text: "⎇ ", style: styleMeta}, metaSegment{text: branch, style: styleBranch})
 	}
 	if t.Status == statusCompleted && !t.Acknowledged {
-		segs = append(segs, sep("  ·  awaiting review"))
+		segs = append(segs, sep("  ·  ⚑ review"))
 	}
 	if t.Status == statusNeedsConfirmation {
-		segs = append(segs, sep("  ·  needs confirmation"))
+		segs = append(segs, sep("  ·  ! confirm"))
 	}
 	if d := liveDuration(t, now); d != "" {
 		segs = append(segs, sep("  ·  "), metaSegment{text: d, style: styleMeta})
@@ -577,7 +615,7 @@ func (m model) renderRow(t ipc.Task, selected bool, width int, now time.Time) st
 			end = len(t.Notes)
 		}
 		for i := start; i < end; i++ {
-			text := fit("- "+strings.TrimSpace(t.Notes[i].Text), width-4)
+			text := fit("└ "+strings.TrimSpace(t.Notes[i].Text), width-4)
 			style := styleNote
 			if m.noteSelect && i == m.noteCursor {
 				style = styleNoteSel
@@ -650,15 +688,15 @@ func truncateToWidth(s string, w int) string {
 
 func (m model) renderHelp(width int) string {
 	lines := []string{
-		fmt.Sprintf("%s / %s   move up / down", m.keys.Up, m.keys.Down),
-		fmt.Sprintf("%s          open the task's tmux pane", m.keys.Open),
-		fmt.Sprintf("%s          finish an in-progress task / acknowledge a completed one", m.keys.Toggle),
-		fmt.Sprintf("%s          delete the selected task", m.keys.Delete),
-		fmt.Sprintf("%s          add a note to the selected task", m.keys.AddNote),
-		"x          pick a note of the selected task to delete",
-		fmt.Sprintf("%s          refresh now", m.keys.Refresh),
-		fmt.Sprintf("%s          toggle this help", m.keys.Help),
-		fmt.Sprintf("%s / q      quit", m.keys.Cancel),
+		fmt.Sprintf("%s / %s        move up / down", m.keys.Up, m.keys.Down),
+		fmt.Sprintf("%s          ⏎  jump to task's tmux pane", m.keys.Open),
+		fmt.Sprintf("%s           ✓  finish / acknowledge task", m.keys.Toggle),
+		fmt.Sprintf("%s          ✕  delete selected task", m.keys.Delete),
+		fmt.Sprintf("%s           ✚  add note to selected task", m.keys.AddNote),
+		"x           ✕  pick and delete a note",
+		fmt.Sprintf("%s           ↻  refresh now", m.keys.Refresh),
+		fmt.Sprintf("%s           ?  toggle this help", m.keys.Help),
+		fmt.Sprintf("%s / q       quit", m.keys.Cancel),
 	}
 	out := make([]string, len(lines))
 	for i, l := range lines {
@@ -669,9 +707,9 @@ func (m model) renderHelp(width int) string {
 
 func (m model) footer() string {
 	if m.noteSelect {
-		return fmt.Sprintf("%s/%s pick note  enter delete  esc cancel", m.keys.Up, m.keys.Down)
+		return fmt.Sprintf("%s/%s pick note  ⏎ delete  esc cancel", m.keys.Up, m.keys.Down)
 	}
-	return fmt.Sprintf("%s/%s move  %s open  %s toggle  %s note  x delnote  %s delete  %s refresh  %s quit",
+	return fmt.Sprintf("%s/%s move  %s open  %s ✓  %s ✚ note  x ✕ note  %s ✕ task  %s ↻  %s quit",
 		m.keys.Up, m.keys.Down, m.keys.Open, m.keys.Toggle, m.keys.AddNote, m.keys.Delete, m.keys.Refresh, m.keys.Cancel)
 }
 
