@@ -112,21 +112,26 @@ type stateMsg struct {
 type cmdResultMsg struct{ err error }
 
 type model struct {
-	keys       keyConfig
-	width      int
-	height     int
-	state      ipc.Envelope
+	keys        keyConfig
+	width       int
+	height      int
+	state       ipc.Envelope
 	cursor      int
 	scroll      int // top row of visible window
 	selKey      string
 	err         string
-	help       bool
-	noteMode   bool
-	noteInput  string
-	noteSelect bool
-	noteCursor int
-	ctx        tmuxCtx
-	loaded     bool
+	help        bool
+	noteMode    bool
+	noteInput   string
+	noteSelect  bool
+	noteCursor  int
+	closeSelect bool
+	closeCursor int
+	tdevMode    bool
+	tdevKind    string
+	tdevInput   string
+	ctx         tmuxCtx
+	loaded      bool
 }
 
 type tmuxCtx struct {
@@ -188,6 +193,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, poll()
 	case tea.KeyMsg:
+		if m.tdevMode {
+			return m.handleTdevKey(msg)
+		}
 		if m.noteMode {
 			return m.handleNoteKey(msg)
 		}
@@ -197,6 +205,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleKey(key string) (tea.Model, tea.Cmd) {
+	if m.closeSelect {
+		return m.handleCloseKey(key)
+	}
 	if m.noteSelect {
 		return m.handleNoteSelectKey(key)
 	}
@@ -225,8 +236,19 @@ func (m *model) handleKey(key string) (tea.Model, tea.Cmd) {
 		}
 	case m.keys.Open:
 		return m, m.focusSelected()
+	case "o":
+		m.startTdevInput("-o")
+		return m, nil
+	case "C":
+		m.startTdevInput("-c")
+		return m, nil
 	case m.keys.Toggle:
-		return m, m.toggleSelected()
+		if m.selected() != nil {
+			m.closeSelect = true
+			m.closeCursor = 0
+			return m, nil
+		}
+		return m, nil
 	case m.keys.Delete:
 		return m, m.deleteSelected()
 	case m.keys.AddNote:
@@ -243,6 +265,73 @@ func (m *model) handleKey(key string) (tea.Model, tea.Cmd) {
 			m.noteCursor = len(t.Notes) - 1
 		}
 		return m, nil
+	}
+	return m, nil
+}
+
+func (m *model) handleCloseKey(key string) (tea.Model, tea.Cmd) {
+	t := m.selected()
+	if t == nil {
+		m.closeSelect = false
+		return m, nil
+	}
+	switch key {
+	case m.keys.Cancel, "esc", "q", "ctrl+c":
+		m.closeSelect = false
+		return m, nil
+	case m.keys.Up, m.keys.Down, "up", "down", "tab":
+		if m.closeCursor == 0 {
+			m.closeCursor = 1
+		} else {
+			m.closeCursor = 0
+		}
+		return m, nil
+	case "1":
+		m.closeSelect = false
+		return m, m.closeSelected(false)
+	case "2":
+		m.closeSelect = false
+		return m, m.closeSelected(true)
+	case m.keys.Open, "enter":
+		deleteWorktree := m.closeCursor == 1
+		m.closeSelect = false
+		return m, m.closeSelected(deleteWorktree)
+	}
+	return m, nil
+}
+
+func (m *model) startTdevInput(kind string) {
+	m.tdevMode = true
+	m.tdevKind = kind
+	m.tdevInput = ""
+	if t := m.selected(); t != nil {
+		m.tdevInput = tdevLaunchBranch(t.Branch)
+	}
+}
+
+func (m *model) handleTdevKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.tdevMode = false
+		m.tdevKind = ""
+		m.tdevInput = ""
+		return m, nil
+	case "enter":
+		kind := m.tdevKind
+		input := strings.TrimSpace(m.tdevInput)
+		m.tdevMode = false
+		m.tdevKind = ""
+		m.tdevInput = ""
+		return m, m.launchTdev(kind, input)
+	case "backspace", "ctrl+h":
+		if len(m.tdevInput) > 0 {
+			r := []rune(m.tdevInput)
+			m.tdevInput = string(r[:len(r)-1])
+		}
+		return m, nil
+	}
+	if len(msg.Runes) > 0 {
+		m.tdevInput += string(msg.Runes)
 	}
 	return m, nil
 }
@@ -388,19 +477,28 @@ func (m *model) focusSelected() tea.Cmd {
 	}
 }
 
-func (m *model) toggleSelected() tea.Cmd {
+func (m *model) closeSelected(deleteWorktree bool) tea.Cmd {
 	t := m.selected()
 	if t == nil {
 		return nil
 	}
 	task := *t
 	return func() tea.Msg {
-		env := ipc.Envelope{SessionID: task.SessionID, WindowID: task.WindowID, Pane: task.Pane}
-		cmd := "acknowledge"
-		if task.Status == statusInProgress {
-			cmd = "finish_task"
+		if err := runTdevClose(task, deleteWorktree); err != nil {
+			return cmdResultMsg{err: err}
 		}
-		return cmdResultMsg{err: sendCommand(cmd, &env)}
+		env := ipc.Envelope{SessionID: task.SessionID, WindowID: task.WindowID, Pane: task.Pane}
+		return cmdResultMsg{err: sendCommand("delete_task", &env)}
+	}
+}
+
+func (m *model) launchTdev(mode, input string) tea.Cmd {
+	t := m.selected()
+	return func() tea.Msg {
+		if err := runTdevLaunch(mode, input, t); err != nil {
+			return cmdResultMsg{err: err}
+		}
+		return cmdResultMsg{}
 	}
 }
 
@@ -476,6 +574,14 @@ func (m model) View() string {
 		b.WriteString("\n")
 	} else {
 		b.WriteString(m.renderTasks(width))
+	}
+	if m.closeSelect {
+		b.WriteString("\n")
+		b.WriteString(m.renderClosePrompt(width))
+	}
+	if m.tdevMode {
+		b.WriteString("\n")
+		b.WriteString(m.renderTdevPrompt(width))
 	}
 	if m.err != "" {
 		b.WriteString("\n")
@@ -690,7 +796,9 @@ func (m model) renderHelp(width int) string {
 	lines := []string{
 		fmt.Sprintf("%s / %s        move up / down", m.keys.Up, m.keys.Down),
 		fmt.Sprintf("%s          ⏎  jump to task's tmux pane", m.keys.Open),
-		fmt.Sprintf("%s           ✓  finish / acknowledge task", m.keys.Toggle),
+		"o           ◧  tdev -o with typed worktree",
+		"C           ◨  tdev -c with typed worktree",
+		fmt.Sprintf("%s           ✓  choose tdev close", m.keys.Toggle),
 		fmt.Sprintf("%s          ✕  delete selected task", m.keys.Delete),
 		fmt.Sprintf("%s           ✚  add note to selected task", m.keys.AddNote),
 		"x           ✕  pick and delete a note",
@@ -705,11 +813,49 @@ func (m model) renderHelp(width int) string {
 	return strings.Join(out, "\n")
 }
 
+func (m model) renderClosePrompt(width int) string {
+	target := ""
+	if t := m.selected(); t != nil {
+		target = tdevCloseTarget(*t)
+	}
+	plain := "tdev close"
+	deleteCmd := "tdev close -d"
+	if target != "" {
+		plain = "tdev close " + target
+		deleteCmd = "tdev close " + target + " -d"
+	}
+	choices := []string{plain, deleteCmd}
+	parts := []string{"close task: "}
+	for i, choice := range choices {
+		mark := "  "
+		if i == m.closeCursor {
+			mark = "▸ "
+		}
+		parts = append(parts, fmt.Sprintf("%d %s%s", i+1, mark, choice))
+		if i == 0 {
+			parts = append(parts, "  ·  ")
+		}
+	}
+	parts = append(parts, "  ·  enter choose  esc cancel")
+	return styleConfirm.Render(fit(strings.Join(parts, ""), width-2))
+}
+
+func (m model) renderTdevPrompt(width int) string {
+	cmd := "tdev " + m.tdevKind
+	return styleConfirm.Render(fit(cmd+" worktree: "+m.tdevInput+"▏", width-2))
+}
+
 func (m model) footer() string {
+	if m.tdevMode {
+		return "type worktree/branch  enter launch  esc cancel"
+	}
+	if m.closeSelect {
+		return "1 close  2 close -d  enter choose  esc cancel"
+	}
 	if m.noteSelect {
 		return fmt.Sprintf("%s/%s pick note  ⏎ delete  esc cancel", m.keys.Up, m.keys.Down)
 	}
-	return fmt.Sprintf("%s/%s move  %s open  %s ✓  %s ✚ note  x ✕ note  %s ✕ task  %s ↻  %s quit",
+	return fmt.Sprintf("%s/%s move  %s open  o tdev -o  C tdev -c  %s ✓  %s ✚ note  x ✕ note  %s ✕ task  %s ↻  %s quit",
 		m.keys.Up, m.keys.Down, m.keys.Open, m.keys.Toggle, m.keys.AddNote, m.keys.Delete, m.keys.Refresh, m.keys.Cancel)
 }
 
@@ -931,6 +1077,109 @@ func runTmux(args ...string) error {
 		return fmt.Errorf("tmux %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func runTdevClose(t ipc.Task, deleteWorktree bool) error {
+	args := []string{"close"}
+	target := tdevCloseTarget(t)
+	if target == "" {
+		return nil
+	}
+	tdev, err := tdevPath()
+	if err != nil {
+		return err
+	}
+	args = append(args, target)
+	if deleteWorktree {
+		args = append(args, "-d")
+	}
+	cmd := exec.Command(tdev, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if strings.Contains(msg, "no window found for worktree") {
+			return nil
+		}
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("tdev %s: %s", strings.Join(args, " "), msg)
+	}
+	return nil
+}
+
+func runTdevLaunch(mode, input string, t *ipc.Task) error {
+	if mode != "-o" && mode != "-c" {
+		return fmt.Errorf("unsupported tdev mode %q", mode)
+	}
+	tdev, err := tdevPath()
+	if err != nil {
+		return err
+	}
+	args := []string{mode}
+	typed := strings.Fields(strings.TrimSpace(input))
+	branch, cwd := "", ""
+	if t != nil {
+		branch = tdevLaunchBranch(t.Branch)
+		cwd = strings.TrimSpace(t.CWD)
+	}
+	if len(typed) > 0 {
+		args = append(args, typed...)
+		if len(typed) == 1 && cwd != "" {
+			args = append(args, cwd)
+		}
+	} else {
+		if branch != "" {
+			args = append(args, branch)
+		}
+		if cwd != "" {
+			if branch == "" {
+				args = append(args, "")
+			}
+			args = append(args, cwd)
+		}
+	}
+	cmd := exec.Command(tdev, args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("tdev %s: %s", strings.Join(args, " "), msg)
+	}
+	return nil
+}
+
+func tdevLaunchBranch(branch string) string {
+	branch = strings.TrimSpace(branch)
+	if branch == "main" {
+		return ""
+	}
+	return branch
+}
+
+func tdevPath() (string, error) {
+	if p, err := exec.LookPath("tdev"); err == nil {
+		return p, nil
+	}
+	for _, p := range []string{
+		filepath.Join(os.Getenv("HOME"), "go", "bin", "tdev"),
+		"/opt/homebrew/bin/tdev",
+		"/usr/local/bin/tdev",
+	} {
+		if info, err := os.Stat(p); err == nil && info.Mode()&0111 != 0 {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("tdev not found")
+}
+
+func tdevCloseTarget(t ipc.Task) string {
+	if w := strings.TrimSpace(t.Window); w != "" {
+		return w
+	}
+	return strings.TrimSpace(t.Branch)
 }
 
 func tmuxOutput(args ...string) (string, error) {
