@@ -26,22 +26,29 @@ const (
 )
 
 var (
-	styleTitle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	styleMeta    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	styleMuted   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	styleLive    = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	styleConfirm = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
-	styleReview  = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
-	styleDone    = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
+	styleTitle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	styleMeta    = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	styleMuted   = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
+	styleLive    = lipgloss.NewStyle().Foreground(lipgloss.Color("79"))
+	styleConfirm = lipgloss.NewStyle().Foreground(lipgloss.Color("215"))
+	styleReview  = lipgloss.NewStyle().Foreground(lipgloss.Color("223"))
+	styleDone    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	styleError   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	styleSelBG   = lipgloss.Color("236")
+	styleSelBG   = lipgloss.Color("237")
+	styleFooter  = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("60")).Padding(0, 1)
 
-	// Distinct colors per kind of metadata.
-	styleCWD     = lipgloss.NewStyle().Foreground(lipgloss.Color("111")) // directory — cornflower blue
-	styleBranch  = lipgloss.NewStyle().Foreground(lipgloss.Color("114")) // git branch — green
-	styleNote    = lipgloss.NewStyle().Foreground(lipgloss.Color("180")) // notes — tan/gold
-	styleNoteSel = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("130"))
+	styleCWD      = lipgloss.NewStyle().Foreground(lipgloss.Color("110"))
+	styleBranch   = lipgloss.NewStyle().Foreground(lipgloss.Color("115"))
+	styleNote     = lipgloss.NewStyle().Foreground(lipgloss.Color("180"))
+	styleNoteDone = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Strikethrough(true)
+
+	gitMarkerCache = map[string]gitMarkerCacheEntry{}
 )
+
+type gitMarkerCacheEntry struct {
+	marker    string
+	expiresAt time.Time
+}
 
 type keyConfig struct {
 	Up, Down, Open, Cancel, Toggle, Delete, Help, Refresh, AddNote string
@@ -336,7 +343,6 @@ func (m *model) handleTdevKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleNoteSelectKey drives the "pick a note to delete" overlay.
 func (m *model) handleNoteSelectKey(key string) (tea.Model, tea.Cmd) {
 	t := m.selected()
 	if t == nil || len(t.Notes) == 0 {
@@ -357,6 +363,9 @@ func (m *model) handleNoteSelectKey(key string) (tea.Model, tea.Cmd) {
 			m.noteCursor++
 		}
 		return m, nil
+	case m.keys.Toggle, "c", " ":
+		idx := m.noteCursor
+		return m, m.toggleNoteAt(idx)
 	case m.keys.Open, "enter", "x", m.keys.Delete, "d":
 		idx := m.noteCursor
 		m.noteSelect = false
@@ -539,6 +548,19 @@ func (m *model) deleteNoteAt(index int) tea.Cmd {
 	}
 }
 
+func (m *model) toggleNoteAt(index int) tea.Cmd {
+	t := m.selected()
+	if t == nil || index < 0 || index >= len(t.Notes) {
+		return nil
+	}
+	task := *t
+	idx := index
+	return func() tea.Msg {
+		env := ipc.Envelope{SessionID: task.SessionID, WindowID: task.WindowID, Pane: task.Pane, NoteIndex: &idx}
+		return cmdResultMsg{err: sendCommand("toggle_note", &env)}
+	}
+}
+
 func (m *model) refreshContext() {
 	ctx := tmuxCtx{}
 	out, err := tmuxOutput("display-message", "-p", "#{session_name}:::#{session_id}:::#{window_name}:::#{window_id}:::#{pane_id}")
@@ -561,7 +583,7 @@ func (m model) View() string {
 	}
 	width := m.width
 	var b strings.Builder
-	b.WriteString(styleTitle.Render("Tracker"))
+	b.WriteString(styleTitle.Render("▣ Agent Tracker"))
 	if loc := m.contextLine(); loc != "" {
 		b.WriteString(styleMeta.Render("  ·  " + loc))
 	}
@@ -592,7 +614,7 @@ func (m model) View() string {
 		b.WriteString(styleConfirm.Render("note: " + m.noteInput + "▏"))
 	}
 	b.WriteString("\n")
-	b.WriteString(styleMeta.Render(m.footer()))
+	b.WriteString(m.renderFooter(width))
 	return b.String()
 }
 
@@ -623,14 +645,14 @@ func (m model) metricsLine() string {
 		}
 	}
 	liveDot := styleLive.Render("●")
-	reviewDot := styleReview.Render("●")
+	reviewDot := styleReview.Render("◇")
 	return fmt.Sprintf("%s %d active  ·  %s %d review", liveDot, active, reviewDot, review)
 }
 
 func (m model) renderTasks(width int) string {
 	tasks := m.tasks()
 	if len(tasks) == 0 {
-		return styleMuted.Render("No tasks in motion. Agents report tasks via the tracker MCP.")
+		return styleMuted.Render("No active tasks. Agents will appear here when they report work.")
 	}
 	now := time.Now()
 	rowsPerPage := m.height - 6
@@ -658,24 +680,24 @@ func (m model) renderTasks(width int) string {
 func (m model) renderRow(t ipc.Task, selected bool, width int, now time.Time) string {
 	indicator := taskIndicator(t, now)
 	indicatorStyle := styleLive
-	titleStyle := lipgloss.NewStyle().Bold(true)
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
 	switch t.Status {
 	case statusNeedsConfirmation:
 		indicatorStyle = styleConfirm
-		titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+		titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("215"))
 	case statusCompleted:
 		if t.Acknowledged {
 			indicatorStyle = styleDone
-			titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
+			titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 		} else {
 			indicatorStyle = styleReview
-			titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230"))
+			titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("223"))
 		}
 	}
 	if selected {
 		bg := styleSelBG
 		indicatorStyle = indicatorStyle.Background(bg)
-		titleStyle = titleStyle.Background(bg).Foreground(lipgloss.Color("230"))
+		titleStyle = titleStyle.Background(bg).Foreground(lipgloss.Color("255"))
 	}
 	title := fit(strings.TrimSpace(t.Summary), width-4)
 
@@ -683,22 +705,22 @@ func (m model) renderRow(t ipc.Task, selected bool, width int, now time.Time) st
 	sep := func(s string) metaSegment { return metaSegment{text: s, style: styleMeta} }
 	segs := []metaSegment{{text: strings.TrimSpace(t.Session), style: styleMeta}}
 	if w := strings.TrimSpace(t.Window); w != "" {
-		segs = append(segs, sep("  /  "), metaSegment{text: w, style: styleMeta})
+		segs = append(segs, sep("  ›  "), metaSegment{text: w, style: styleMeta})
 	}
 	if cwd := displayCWD(t.CWD); cwd != "" {
-		segs = append(segs, sep("  · "), metaSegment{text: "~/", style: styleMeta}, metaSegment{text: cwd, style: styleCWD})
+		segs = append(segs, sep("  ·  "), metaSegment{text: "⌂ ", style: styleMeta}, metaSegment{text: cwd, style: styleCWD})
 	}
 	if branch := strings.TrimSpace(t.Branch); branch != "" {
-		segs = append(segs, sep("  "), metaSegment{text: "⎇ ", style: styleMeta}, metaSegment{text: branch, style: styleBranch})
+		segs = append(segs, sep("  "), metaSegment{text: gitBranchMarker(t.CWD), style: styleMeta}, metaSegment{text: branch, style: styleBranch})
 	}
 	if t.Status == statusCompleted && !t.Acknowledged {
-		segs = append(segs, sep("  ·  ⚑ review"))
+		segs = append(segs, sep("  ·  ◇ review"))
 	}
 	if t.Status == statusNeedsConfirmation {
-		segs = append(segs, sep("  ·  ! confirm"))
+		segs = append(segs, sep("  ·  ◆ confirm"))
 	}
 	if d := liveDuration(t, now); d != "" {
-		segs = append(segs, sep("  ·  "), metaSegment{text: d, style: styleMeta})
+		segs = append(segs, sep("  ·  "), metaSegment{text: "◷ " + d, style: styleMeta})
 	}
 	metaLine := renderMetaLine(segs, width-2, selected, styleSelBG)
 	row := " " + indicatorStyle.Render(indicator) + " " + titleStyle.Render(title) + "\n   " + metaLine
@@ -721,16 +743,22 @@ func (m model) renderRow(t ipc.Task, selected bool, width int, now time.Time) st
 			end = len(t.Notes)
 		}
 		for i := start; i < end; i++ {
-			text := fit("└ "+strings.TrimSpace(t.Notes[i].Text), width-4)
+			note := t.Notes[i]
+			mark := "✎"
 			style := styleNote
+			if note.Done {
+				mark = "✓"
+				style = styleNoteDone
+			}
+			text := fit("│ "+mark+" "+strings.TrimSpace(note.Text), width-4)
 			if m.noteSelect && i == m.noteCursor {
-				style = styleNoteSel
+				style = style.Background(lipgloss.Color("94")).Foreground(lipgloss.Color("231"))
 			}
 			row += "\n   " + style.Render(text)
 		}
 		if m.noteSelect {
-			hint := fmt.Sprintf("delete note %d/%d  ·  %s/%s move  ·  enter delete  ·  esc cancel",
-				m.noteCursor+1, len(t.Notes), m.keys.Up, m.keys.Down)
+			hint := fmt.Sprintf("note %d/%d  ·  %s/%s move  ·  c done  ·  enter delete  ·  esc cancel",
+				m.noteCursor+1, len(t.Notes), m.keys.Down, m.keys.Up)
 			row += "\n   " + styleConfirm.Render(fit(hint, width-2))
 		}
 	}
@@ -794,16 +822,16 @@ func truncateToWidth(s string, w int) string {
 
 func (m model) renderHelp(width int) string {
 	lines := []string{
-		fmt.Sprintf("%s / %s        move up / down", m.keys.Up, m.keys.Down),
-		fmt.Sprintf("%s          ⏎  jump to task's tmux pane", m.keys.Open),
-		"o           ◧  tdev -o with typed worktree",
-		"C           ◨  tdev -c with typed worktree",
-		fmt.Sprintf("%s           ✓  choose tdev close", m.keys.Toggle),
-		fmt.Sprintf("%s          ✕  delete selected task", m.keys.Delete),
-		fmt.Sprintf("%s           ✚  add note to selected task", m.keys.AddNote),
-		"x           ✕  pick and delete a note",
-		fmt.Sprintf("%s           ↻  refresh now", m.keys.Refresh),
-		fmt.Sprintf("%s           ?  toggle this help", m.keys.Help),
+		fmt.Sprintf("%s / %s       move selection", m.keys.Down, m.keys.Up),
+		fmt.Sprintf("%s          ↵  jump to tmux pane", m.keys.Open),
+		"o           ⟡  open/create worktree",
+		"C           ⟠  open/create worktree",
+		fmt.Sprintf("%s           ◆  close task", m.keys.Toggle),
+		fmt.Sprintf("%s           ×  delete task", m.keys.Delete),
+		fmt.Sprintf("%s           ✎  add note", m.keys.AddNote),
+		"x           ✎  manage notes",
+		fmt.Sprintf("%s           ↻  refresh", m.keys.Refresh),
+		fmt.Sprintf("%s           ?  toggle help", m.keys.Help),
 		fmt.Sprintf("%s / q       quit", m.keys.Cancel),
 	}
 	out := make([]string, len(lines))
@@ -827,9 +855,9 @@ func (m model) renderClosePrompt(width int) string {
 	choices := []string{plain, deleteCmd}
 	parts := []string{"close task: "}
 	for i, choice := range choices {
-		mark := "  "
+		mark := "○ "
 		if i == m.closeCursor {
-			mark = "▸ "
+			mark = "● "
 		}
 		parts = append(parts, fmt.Sprintf("%d %s%s", i+1, mark, choice))
 		if i == 0 {
@@ -841,22 +869,99 @@ func (m model) renderClosePrompt(width int) string {
 }
 
 func (m model) renderTdevPrompt(width int) string {
-	cmd := "tdev " + m.tdevKind
-	return styleConfirm.Render(fit(cmd+" worktree: "+m.tdevInput+"▏", width-2))
+	return styleConfirm.Render(fit("open/create worktree: "+m.tdevInput+"▏", width-2))
 }
 
-func (m model) footer() string {
+func (m model) renderFooter(width int) string {
+	lines := m.footerLines()
+	if width <= 4 {
+		return styleMeta.Render(strings.Join(lines, "\n"))
+	}
+	innerWidth := width - 4
+	for i, line := range lines {
+		lines[i] = fit(line, innerWidth)
+	}
+	return styleFooter.Render(strings.Join(lines, "\n"))
+}
+
+func (m model) footerLines() []string {
 	if m.tdevMode {
-		return "type worktree/branch  enter launch  esc cancel"
+		return []string{
+			"Worktree  │  type branch/path",
+			"Actions   │  enter launch  ·  esc cancel",
+		}
 	}
 	if m.closeSelect {
-		return "1 close  2 close -d  enter choose  esc cancel"
+		return []string{
+			"Close     │  1 close  ·  2 close -d",
+			"Actions   │  enter choose  ·  esc cancel",
+		}
 	}
 	if m.noteSelect {
-		return fmt.Sprintf("%s/%s pick note  ⏎ delete  esc cancel", m.keys.Up, m.keys.Down)
+		return []string{
+			fmt.Sprintf("Move      │  %s/%s pick note", m.keys.Down, m.keys.Up),
+			"Actions   │  c done  ·  enter delete  ·  esc cancel",
+		}
 	}
-	return fmt.Sprintf("%s/%s move  %s open  o tdev -o  C tdev -c  %s ✓  %s ✚ note  x ✕ note  %s ✕ task  %s ↻  %s quit",
-		m.keys.Up, m.keys.Down, m.keys.Open, m.keys.Toggle, m.keys.AddNote, m.keys.Delete, m.keys.Refresh, m.keys.Cancel)
+	return []string{
+		fmt.Sprintf("Move      │  %s/%s select  ·  %s open", m.keys.Down, m.keys.Up, m.keys.Open),
+		"Worktree  │  o open/create worktree",
+		fmt.Sprintf("          │  C open/create worktree  ·  %s close", m.keys.Toggle),
+		fmt.Sprintf("Notes     │  %s add  ·  x manage", m.keys.AddNote),
+		fmt.Sprintf("System    │  %s delete task  ·  %s refresh  ·  %s quit", m.keys.Delete, m.keys.Refresh, m.keys.Cancel),
+	}
+}
+
+func gitBranchMarker(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return " "
+	}
+	now := time.Now()
+	if cached, ok := gitMarkerCache[cwd]; ok && now.Before(cached.expiresAt) {
+		return cached.marker
+	}
+	marker := readGitBranchMarker(cwd)
+	gitMarkerCache[cwd] = gitMarkerCacheEntry{marker: marker, expiresAt: now.Add(2 * time.Second)}
+	return marker
+}
+
+func readGitBranchMarker(cwd string) string {
+	out, err := exec.Command("git", "-C", cwd, "status", "--porcelain=v2", "--branch").Output()
+	if err != nil {
+		return " "
+	}
+	ahead, behind, changed := false, false, false
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "# branch.ab ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 4 {
+				ahead = fields[2] != "+0"
+				behind = fields[3] != "-0"
+			}
+			continue
+		}
+		if !strings.HasPrefix(line, "#") {
+			changed = true
+		}
+	}
+	if changed {
+		return "* "
+	}
+	if ahead && behind {
+		return "⇅ "
+	}
+	if ahead {
+		return "⇡ "
+	}
+	if behind {
+		return "⇣ "
+	}
+	return " "
 }
 
 func displayCWD(path string) string {
@@ -881,12 +986,12 @@ func taskIndicator(t ipc.Task, now time.Time) string {
 		frames := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
 		return string(frames[int(now.UnixNano()/int64(100*time.Millisecond))%len(frames)])
 	case statusNeedsConfirmation:
-		return "!"
+		return "◆"
 	case statusCompleted:
 		if t.Acknowledged {
 			return "✓"
 		}
-		return "⚑"
+		return "◇"
 	}
 	return "•"
 }

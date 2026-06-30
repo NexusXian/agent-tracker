@@ -30,6 +30,7 @@ const (
 type noteRecord struct {
 	Text      string
 	CreatedAt time.Time
+	Done      bool
 }
 
 type taskRecord struct {
@@ -276,6 +277,17 @@ func (s *server) handleCommand(env ipc.Envelope) error {
 		s.broadcastStateAsync()
 		s.statusRefreshAsync()
 		return nil
+	case "toggle_note":
+		target, err := requireSessionWindow(env)
+		if err != nil {
+			return err
+		}
+		if err := s.toggleNote(target, env.NoteIndex); err != nil {
+			return err
+		}
+		s.broadcastStateAsync()
+		s.statusRefreshAsync()
+		return nil
 	case "acknowledge":
 		target, err := requireSessionWindow(env)
 		if err != nil {
@@ -439,6 +451,25 @@ func (s *server) deleteNote(target tmuxTarget, noteIndex *int) error {
 		idx = *noteIndex
 	}
 	t.Notes = append(t.Notes[:idx], t.Notes[idx+1:]...)
+	return nil
+}
+
+func (s *server) toggleNote(target tmuxTarget, noteIndex *int) error {
+	if target.SessionID == "" || target.WindowID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := taskKey(target.SessionID, target.WindowID, target.PaneID)
+	t, ok := s.tasks[key]
+	if !ok || len(t.Notes) == 0 {
+		return nil
+	}
+	idx := len(t.Notes) - 1
+	if noteIndex != nil && *noteIndex >= 0 && *noteIndex < len(t.Notes) {
+		idx = *noteIndex
+	}
+	t.Notes[idx].Done = !t.Notes[idx].Done
 	return nil
 }
 
@@ -743,7 +774,7 @@ func (s *server) buildStateEnvelope() *ipc.Envelope {
 			if !note.CreatedAt.IsZero() {
 				created = note.CreatedAt.Format(time.RFC3339)
 			}
-			notes = append(notes, ipc.Note{Text: text, CreatedAt: created})
+			notes = append(notes, ipc.Note{Text: text, CreatedAt: created, Done: note.Done})
 		}
 		tasks = append(tasks, ipc.Task{
 			SessionID: t.SessionID, Session: sessionName, WindowID: t.WindowID,

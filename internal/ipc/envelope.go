@@ -21,6 +21,7 @@ type Envelope struct {
 type Note struct {
 	Text      string `json:"text"`
 	CreatedAt string `json:"created_at"`
+	Done      bool   `json:"done,omitempty"`
 }
 
 type Task struct {
