@@ -1,0 +1,13 @@
+{
+  "keys": {
+    "move_up": "k",
+    "move_down": "j",
+    "edit": "Enter",
+    "cancel": "Escape",
+    "toggle_todo": "c",
+    "destroy": "D",
+    "help": "?",
+    "refresh": "r"
+  },
+  "notifications_enabled": true
+}
