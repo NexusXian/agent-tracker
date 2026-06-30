@@ -11,9 +11,16 @@ type Envelope struct {
 	Pane      string `json:"pane,omitempty"`
 	Message   string `json:"message,omitempty"`
 	Summary   string `json:"summary,omitempty"`
+	Note      string `json:"note,omitempty"`
+	NoteIndex *int   `json:"note_index,omitempty"`
 	CWD       string `json:"cwd,omitempty"`
 	Branch    string `json:"branch,omitempty"`
 	Tasks     []Task `json:"tasks,omitempty"`
+}
+
+type Note struct {
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
 }
 
 type Task struct {
@@ -24,6 +31,7 @@ type Task struct {
 	Pane            string  `json:"pane,omitempty"`
 	Status          string  `json:"status"`
 	Summary         string  `json:"summary"`
+	Notes           []Note  `json:"notes,omitempty"`
 	CWD             string  `json:"cwd,omitempty"`
 	Branch          string  `json:"branch,omitempty"`
 	CompletionNote  string  `json:"completion_note,omitempty"`

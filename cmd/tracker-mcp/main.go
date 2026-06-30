@@ -87,6 +87,25 @@ type updateInput struct {
 	Branch  string `json:"branch,omitempty"`
 }
 
+type confirmationInput struct {
+	Summary string `json:"summary,omitempty"`
+	TmuxID  string `json:"tmux_id"`
+	CWD     string `json:"cwd,omitempty"`
+	Branch  string `json:"branch,omitempty"`
+}
+
+type noteInput struct {
+	Note   string `json:"note"`
+	TmuxID string `json:"tmux_id"`
+	CWD    string `json:"cwd,omitempty"`
+	Branch string `json:"branch,omitempty"`
+}
+
+type deleteNoteInput struct {
+	TmuxID    string `json:"tmux_id"`
+	NoteIndex *int   `json:"note_index,omitempty"`
+}
+
 func main() {
 	log.SetFlags(0)
 	client := newTrackerClient()
@@ -152,6 +171,61 @@ func main() {
 			return nil, nil, err
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Task updated."}}}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "needs_confirmation",
+		Description: "Mark the task for a tmux session/window/pane as waiting for user confirmation.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input confirmationInput) (*mcp.CallToolResult, any, error) {
+		target, err := parseTmuxID(input.TmuxID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := client.sendCommand(ctx, ipc.Envelope{
+			Command: "needs_confirmation", SessionID: target.SessionID, WindowID: target.WindowID,
+			Pane: target.PaneID, Summary: input.Summary, CWD: input.CWD, Branch: input.Branch,
+		}); err != nil {
+			return nil, nil, err
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Task marked as needing confirmation."}}}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "add_note",
+		Description: "Append a note to the task for a tmux session/window/pane.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input noteInput) (*mcp.CallToolResult, any, error) {
+		target, err := parseTmuxID(input.TmuxID)
+		if err != nil {
+			return nil, nil, err
+		}
+		note := strings.TrimSpace(input.Note)
+		if note == "" {
+			return nil, nil, fmt.Errorf("note is required")
+		}
+		if err := client.sendCommand(ctx, ipc.Envelope{
+			Command: "add_note", SessionID: target.SessionID, WindowID: target.WindowID,
+			Pane: target.PaneID, Note: note, CWD: input.CWD, Branch: input.Branch,
+		}); err != nil {
+			return nil, nil, err
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Note added."}}}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "delete_note",
+		Description: "Delete a note from a task. Pass tmux_id and optionally note_index (0-based); if note_index is omitted the last note is removed.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input deleteNoteInput) (*mcp.CallToolResult, any, error) {
+		target, err := parseTmuxID(input.TmuxID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := client.sendCommand(ctx, ipc.Envelope{
+			Command: "delete_note", SessionID: target.SessionID, WindowID: target.WindowID,
+			Pane: target.PaneID, NoteIndex: input.NoteIndex,
+		}); err != nil {
+			return nil, nil, err
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Note deleted."}}}, nil, nil
 	})
 
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {

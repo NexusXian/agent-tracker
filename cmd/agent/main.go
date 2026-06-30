@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	statusInProgress = "in_progress"
-	statusCompleted  = "completed"
+	statusInProgress        = "in_progress"
+	statusNeedsConfirmation = "needs_confirmation"
+	statusCompleted         = "completed"
 )
 
 var (
@@ -29,19 +30,26 @@ var (
 	styleMeta    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	styleMuted   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	styleLive    = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	styleConfirm = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 	styleReview  = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 	styleDone    = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
 	styleError   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	styleSelBG   = lipgloss.Color("236")
+
+	// Distinct colors per kind of metadata.
+	styleCWD     = lipgloss.NewStyle().Foreground(lipgloss.Color("111")) // directory — cornflower blue
+	styleBranch  = lipgloss.NewStyle().Foreground(lipgloss.Color("114")) // git branch — green
+	styleNote    = lipgloss.NewStyle().Foreground(lipgloss.Color("180")) // notes — tan/gold
+	styleNoteSel = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("130"))
 )
 
 type keyConfig struct {
-	Up, Down, Open, Cancel, Toggle, Delete, Help, Refresh string
+	Up, Down, Open, Cancel, Toggle, Delete, Help, Refresh, AddNote string
 }
 
 func defaultKeys() keyConfig {
 	return keyConfig{Up: "k", Down: "j", Open: "enter", Cancel: "esc",
-		Toggle: "c", Delete: "D", Help: "?", Refresh: "r"}
+		Toggle: "c", Delete: "D", Help: "?", Refresh: "r", AddNote: "a"}
 }
 
 type rawConfig struct {
@@ -83,6 +91,8 @@ func loadKeys() keyConfig {
 				k.Delete = v
 			case "help":
 				k.Help = v
+			case "add_note":
+				k.AddNote = v
 			}
 		}
 		for name, val := range raw.Keys {
@@ -95,19 +105,26 @@ func loadKeys() keyConfig {
 
 type animateMsg time.Time
 type refreshMsg time.Time
-type stateMsg struct{ env *ipc.Envelope; err error }
+type stateMsg struct {
+	env *ipc.Envelope
+	err error
+}
 type cmdResultMsg struct{ err error }
 
 type model struct {
-	keys    keyConfig
-	width   int
-	height  int
-	state   ipc.Envelope
-	cursor  int
-	err     string
-	help    bool
-	ctx     tmuxCtx
-	loaded  bool
+	keys       keyConfig
+	width      int
+	height     int
+	state      ipc.Envelope
+	cursor     int
+	err        string
+	help       bool
+	noteMode   bool
+	noteInput  string
+	noteSelect bool
+	noteCursor int
+	ctx        tmuxCtx
+	loaded     bool
 }
 
 type tmuxCtx struct {
@@ -169,12 +186,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, poll()
 	case tea.KeyMsg:
+		if m.noteMode {
+			return m.handleNoteKey(msg)
+		}
 		return m.handleKey(msg.String())
 	}
 	return m, nil
 }
 
 func (m *model) handleKey(key string) (tea.Model, tea.Cmd) {
+	if m.noteSelect {
+		return m.handleNoteSelectKey(key)
+	}
 	if key == m.keys.Cancel || key == "q" || key == "ctrl+c" || key == "alt+a" || key == "M-a" || key == "meta+a" {
 		return m, tea.Quit
 	}
@@ -200,8 +223,76 @@ func (m *model) handleKey(key string) (tea.Model, tea.Cmd) {
 		return m, m.toggleSelected()
 	case m.keys.Delete:
 		return m, m.deleteSelected()
+	case m.keys.AddNote:
+		if m.selected() != nil {
+			m.noteMode = true
+			m.noteInput = ""
+		}
+		return m, nil
 	case m.keys.Refresh, "r":
 		return m, poll()
+	case "x":
+		if t := m.selected(); t != nil && len(t.Notes) > 0 {
+			m.noteSelect = true
+			m.noteCursor = len(t.Notes) - 1
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleNoteSelectKey drives the "pick a note to delete" overlay.
+func (m *model) handleNoteSelectKey(key string) (tea.Model, tea.Cmd) {
+	t := m.selected()
+	if t == nil || len(t.Notes) == 0 {
+		m.noteSelect = false
+		return m, nil
+	}
+	switch key {
+	case m.keys.Cancel, "esc", "q", "ctrl+c":
+		m.noteSelect = false
+		return m, nil
+	case m.keys.Up, "up":
+		if m.noteCursor > 0 {
+			m.noteCursor--
+		}
+		return m, nil
+	case m.keys.Down, "down":
+		if m.noteCursor < len(t.Notes)-1 {
+			m.noteCursor++
+		}
+		return m, nil
+	case m.keys.Open, "enter", "x", m.keys.Delete, "d":
+		idx := m.noteCursor
+		m.noteSelect = false
+		return m, m.deleteNoteAt(idx)
+	}
+	return m, nil
+}
+
+func (m *model) handleNoteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.noteMode = false
+		m.noteInput = ""
+		return m, nil
+	case "enter":
+		note := strings.TrimSpace(m.noteInput)
+		m.noteMode = false
+		m.noteInput = ""
+		if note == "" {
+			return m, nil
+		}
+		return m, m.addNoteSelected(note)
+	case "backspace", "ctrl+h":
+		if len(m.noteInput) > 0 {
+			r := []rune(m.noteInput)
+			m.noteInput = string(r[:len(r)-1])
+		}
+		return m, nil
+	}
+	if len(msg.Runes) > 0 {
+		m.noteInput += string(msg.Runes)
 	}
 	return m, nil
 }
@@ -230,6 +321,20 @@ func (m *model) clamp() {
 	}
 }
 
+func isInPopup() bool {
+	// Most reliable: the tmux key-binding launches us with this env var set
+	// inside display-popup. (#{popup_id}/$TMUX_PANE are unreliable from a
+	// popup because display-message reports the underlying pane.)
+	if strings.TrimSpace(os.Getenv("AGENT_TRACKER_POPUP")) != "" {
+		return true
+	}
+	out, err := exec.Command("tmux", "display-message", "-p", "#{popup_id}").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
 func (m *model) focusSelected() tea.Cmd {
 	t := m.selected()
 	if t == nil {
@@ -237,7 +342,13 @@ func (m *model) focusSelected() tea.Cmd {
 	}
 	return func() tea.Msg {
 		err := focusTask(*t)
-		return cmdResultMsg{err: err}
+		if err != nil {
+			return cmdResultMsg{err: err}
+		}
+		if isInPopup() {
+			return tea.QuitMsg{}
+		}
+		return cmdResultMsg{}
 	}
 }
 
@@ -266,6 +377,31 @@ func (m *model) deleteSelected() tea.Cmd {
 	return func() tea.Msg {
 		env := ipc.Envelope{SessionID: task.SessionID, WindowID: task.WindowID, Pane: task.Pane}
 		return cmdResultMsg{err: sendCommand("delete_task", &env)}
+	}
+}
+
+func (m *model) addNoteSelected(note string) tea.Cmd {
+	t := m.selected()
+	if t == nil {
+		return nil
+	}
+	task := *t
+	return func() tea.Msg {
+		env := ipc.Envelope{SessionID: task.SessionID, WindowID: task.WindowID, Pane: task.Pane, Note: note, CWD: task.CWD, Branch: task.Branch}
+		return cmdResultMsg{err: sendCommand("add_note", &env)}
+	}
+}
+
+func (m *model) deleteNoteAt(index int) tea.Cmd {
+	t := m.selected()
+	if t == nil || index < 0 || index >= len(t.Notes) {
+		return nil
+	}
+	task := *t
+	idx := index
+	return func() tea.Msg {
+		env := ipc.Envelope{SessionID: task.SessionID, WindowID: task.WindowID, Pane: task.Pane, NoteIndex: &idx}
+		return cmdResultMsg{err: sendCommand("delete_note", &env)}
 	}
 }
 
@@ -308,6 +444,10 @@ func (m model) View() string {
 	if m.err != "" {
 		b.WriteString("\n")
 		b.WriteString(styleError.Render("error: " + m.err))
+	}
+	if m.noteMode {
+		b.WriteString("\n")
+		b.WriteString(styleConfirm.Render("note: " + m.noteInput + "▏"))
 	}
 	b.WriteString("\n")
 	b.WriteString(styleMeta.Render(m.footer()))
@@ -375,8 +515,10 @@ func (m model) renderRow(t ipc.Task, selected bool, width int, now time.Time) st
 	indicator := taskIndicator(t, now)
 	indicatorStyle := styleLive
 	titleStyle := lipgloss.NewStyle().Bold(true)
-	metaStyle := styleMeta
 	switch t.Status {
+	case statusNeedsConfirmation:
+		indicatorStyle = styleConfirm
+		titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 	case statusCompleted:
 		if t.Acknowledged {
 			indicatorStyle = styleDone
@@ -390,27 +532,120 @@ func (m model) renderRow(t ipc.Task, selected bool, width int, now time.Time) st
 		bg := styleSelBG
 		indicatorStyle = indicatorStyle.Background(bg)
 		titleStyle = titleStyle.Background(bg).Foreground(lipgloss.Color("230"))
-		metaStyle = metaStyle.Background(bg).Foreground(lipgloss.Color("251"))
 	}
 	title := fit(strings.TrimSpace(t.Summary), width-4)
-	meta := strings.TrimSpace(t.Session)
+
+	// Build the meta line as colored segments so directory/branch stand out.
+	sep := func(s string) metaSegment { return metaSegment{text: s, style: styleMeta} }
+	segs := []metaSegment{{text: strings.TrimSpace(t.Session), style: styleMeta}}
 	if w := strings.TrimSpace(t.Window); w != "" {
-		meta += "  /  " + w
+		segs = append(segs, sep("  /  "), metaSegment{text: w, style: styleMeta})
 	}
 	if cwd := displayCWD(t.CWD); cwd != "" {
-		meta += "  ·  " + cwd
+		segs = append(segs, sep("  ·  "), metaSegment{text: cwd, style: styleCWD})
 	}
 	if branch := strings.TrimSpace(t.Branch); branch != "" {
-		meta += "   " + branch
+		segs = append(segs, sep("   "), metaSegment{text: branch, style: styleBranch})
 	}
 	if t.Status == statusCompleted && !t.Acknowledged {
-		meta += "  ·  awaiting review"
+		segs = append(segs, sep("  ·  awaiting review"))
+	}
+	if t.Status == statusNeedsConfirmation {
+		segs = append(segs, sep("  ·  needs confirmation"))
 	}
 	if d := liveDuration(t, now); d != "" {
-		meta = strings.TrimSpace(meta + "  ·  " + d)
+		segs = append(segs, sep("  ·  "), metaSegment{text: d, style: styleMeta})
 	}
-	meta = fit(meta, width-2)
-	return " " + indicatorStyle.Render(indicator) + " " + titleStyle.Render(title) + "\n   " + metaStyle.Render(meta)
+	metaLine := renderMetaLine(segs, width-2, selected, styleSelBG)
+	row := " " + indicatorStyle.Render(indicator) + " " + titleStyle.Render(title) + "\n   " + metaLine
+
+	if selected && len(t.Notes) > 0 {
+		limit := 4
+		start := len(t.Notes) - limit
+		if start < 0 {
+			start = 0
+		}
+		if m.noteSelect {
+			// Keep the cursor in view within the visible window.
+			start = m.noteCursor - limit + 1
+			if start < 0 {
+				start = 0
+			}
+		}
+		end := start + limit
+		if end > len(t.Notes) {
+			end = len(t.Notes)
+		}
+		for i := start; i < end; i++ {
+			text := fit("- "+strings.TrimSpace(t.Notes[i].Text), width-4)
+			style := styleNote
+			if m.noteSelect && i == m.noteCursor {
+				style = styleNoteSel
+			}
+			row += "\n   " + style.Render(text)
+		}
+		if m.noteSelect {
+			hint := fmt.Sprintf("delete note %d/%d  ·  %s/%s move  ·  enter delete  ·  esc cancel",
+				m.noteCursor+1, len(t.Notes), m.keys.Up, m.keys.Down)
+			row += "\n   " + styleConfirm.Render(fit(hint, width-2))
+		}
+	}
+	return row
+}
+
+type metaSegment struct {
+	text  string
+	style lipgloss.Style
+}
+
+// renderMetaLine concatenates colored segments, truncates to width, and pads the
+// remainder so the selection background (if any) fills the whole line.
+func renderMetaLine(segs []metaSegment, width int, selected bool, bg lipgloss.Color) string {
+	if width < 0 {
+		width = 0
+	}
+	var b strings.Builder
+	used := 0
+	for _, s := range segs {
+		if used >= width {
+			break
+		}
+		text := s.text
+		w := lipgloss.Width(text)
+		if used+w > width {
+			text = truncateToWidth(text, width-used)
+			w = lipgloss.Width(text)
+		}
+		style := s.style
+		if selected {
+			style = style.Background(bg)
+		}
+		b.WriteString(style.Render(text))
+		used += w
+	}
+	if used < width {
+		pad := strings.Repeat(" ", width-used)
+		if selected {
+			b.WriteString(lipgloss.NewStyle().Background(bg).Render(pad))
+		} else {
+			b.WriteString(pad)
+		}
+	}
+	return b.String()
+}
+
+func truncateToWidth(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	r := []rune(s)
+	for len(r) > 0 && lipgloss.Width(string(r))+1 > w {
+		r = r[:len(r)-1]
+	}
+	return string(r) + "…"
 }
 
 func (m model) renderHelp(width int) string {
@@ -419,6 +654,8 @@ func (m model) renderHelp(width int) string {
 		fmt.Sprintf("%s          open the task's tmux pane", m.keys.Open),
 		fmt.Sprintf("%s          finish an in-progress task / acknowledge a completed one", m.keys.Toggle),
 		fmt.Sprintf("%s          delete the selected task", m.keys.Delete),
+		fmt.Sprintf("%s          add a note to the selected task", m.keys.AddNote),
+		"x          pick a note of the selected task to delete",
 		fmt.Sprintf("%s          refresh now", m.keys.Refresh),
 		fmt.Sprintf("%s          toggle this help", m.keys.Help),
 		fmt.Sprintf("%s / q      quit", m.keys.Cancel),
@@ -431,8 +668,11 @@ func (m model) renderHelp(width int) string {
 }
 
 func (m model) footer() string {
-	return fmt.Sprintf("%s/%s move  %s open  %s toggle  %s delete  %s refresh  %s help  %s quit",
-		m.keys.Up, m.keys.Down, m.keys.Open, m.keys.Toggle, m.keys.Delete, m.keys.Refresh, m.keys.Help, m.keys.Cancel)
+	if m.noteSelect {
+		return fmt.Sprintf("%s/%s pick note  enter delete  esc cancel", m.keys.Up, m.keys.Down)
+	}
+	return fmt.Sprintf("%s/%s move  %s open  %s toggle  %s note  x delnote  %s delete  %s refresh  %s quit",
+		m.keys.Up, m.keys.Down, m.keys.Open, m.keys.Toggle, m.keys.AddNote, m.keys.Delete, m.keys.Refresh, m.keys.Cancel)
 }
 
 func displayCWD(path string) string {
@@ -456,6 +696,8 @@ func taskIndicator(t ipc.Task, now time.Time) string {
 	case statusInProgress:
 		frames := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
 		return string(frames[int(now.UnixNano()/int64(100*time.Millisecond))%len(frames)])
+	case statusNeedsConfirmation:
+		return "!"
 	case statusCompleted:
 		if t.Acknowledged {
 			return "✓"
@@ -524,12 +766,14 @@ func sortTasks(tasks []ipc.Task) {
 
 func statusRank(s string) int {
 	switch s {
-	case statusInProgress:
+	case statusNeedsConfirmation:
 		return 0
-	case statusCompleted:
+	case statusInProgress:
 		return 1
+	case statusCompleted:
+		return 2
 	}
-	return 2
+	return 3
 }
 
 func fit(s string, w int) string {
@@ -603,6 +847,10 @@ func sendCommand(command string, env *ipc.Envelope) error {
 		req.WindowID = env.WindowID
 		req.Pane = env.Pane
 		req.Summary = env.Summary
+		req.Note = env.Note
+		req.NoteIndex = env.NoteIndex
+		req.CWD = env.CWD
+		req.Branch = env.Branch
 	}
 	if err := json.NewEncoder(conn).Encode(&req); err != nil {
 		return err
@@ -668,6 +916,8 @@ func renderOneShot(env *ipc.Envelope) string {
 		switch t.Status {
 		case statusInProgress:
 			mark = "▶"
+		case statusNeedsConfirmation:
+			mark = "!"
 		case statusCompleted:
 			if t.Acknowledged {
 				mark = "✓"
@@ -683,9 +933,12 @@ func renderOneShot(env *ipc.Envelope) string {
 			meta += " · " + cwd
 		}
 		if branch := strings.TrimSpace(t.Branch); branch != "" {
-			meta += "  " + branch
+			meta += "  " + branch
 		}
 		fmt.Fprintf(&b, "%s [%s] %s  (%s)\n", mark, t.Status, t.Summary, meta)
+		for _, note := range t.Notes {
+			fmt.Fprintf(&b, "  - %s\n", strings.TrimSpace(note.Text))
+		}
 	}
 	return b.String()
 }

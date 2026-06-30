@@ -126,8 +126,7 @@ Point your coding agent at the `tracker-mcp` binary. Example for opencode/Claude
 {
   "mcpServers": {
     "tracker": {
-      "command": "/path/to/bin/tracker-mcp",
-      "env": { "TRACKER_SOCKET": "/tmp/agent-tracker.sock" }
+      "command": "/path/to/bin/tracker-mcp"
     }
   }
 }
@@ -135,14 +134,14 @@ Point your coding agent at the `tracker-mcp` binary. Example for opencode/Claude
 
 The agent can then call:
 
-- `tracker_start_working` — `{ "tmux_id": "$3:::@12::%30", "summary": "add login flow" }`
-- `tracker_finish_working` — `{ "tmux_id": "$3:::@12::%30", "note": "done" }`
-- `tracker_update_summary` — `{ "tmux_id": "$3:::@12::%30", "summary": "…new summary…" }`
+- `tracker_start_working` — `{ "tmux_id": "$3::@12::%30", "summary": "add login flow" }`
+- `tracker_finish_working` — `{ "tmux_id": "$3::@12::%30", "note": "done" }`
+- `tracker_update_summary` — `{ "tmux_id": "$3::@12::%30", "summary": "…new summary…" }`
 
 `tmux_id` is `session_id::window_id::pane_id`, obtainable inside tmux with:
 
 ```bash
-tmux display-message -p '#{session_id}:::#{window_id}:::#{pane_id}'
+tmux display-message -p '#{session_id}::#{window_id}::#{pane_id}'
 ```
 
 ## TUI keys

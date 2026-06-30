@@ -22,9 +22,15 @@ import (
 )
 
 const (
-	statusInProgress = "in_progress"
-	statusCompleted  = "completed"
+	statusInProgress        = "in_progress"
+	statusNeedsConfirmation = "needs_confirmation"
+	statusCompleted         = "completed"
 )
+
+type noteRecord struct {
+	Text      string
+	CreatedAt time.Time
+}
 
 type taskRecord struct {
 	SessionID      string
@@ -33,6 +39,7 @@ type taskRecord struct {
 	WindowName     string
 	Pane           string
 	Summary        string
+	Notes          []noteRecord
 	CWD            string
 	Branch         string
 	CompletionNote string
@@ -231,6 +238,44 @@ func (s *server) handleCommand(env ipc.Envelope) error {
 		s.broadcastStateAsync()
 		s.statusRefreshAsync()
 		return nil
+	case "needs_confirmation":
+		target, err := requireSessionWindow(env)
+		if err != nil {
+			return err
+		}
+		summary := firstNonEmpty(env.Summary, env.Message)
+		if err := s.markNeedsConfirmation(target, summary, env.CWD, env.Branch); err != nil {
+			return err
+		}
+		s.broadcastStateAsync()
+		s.statusRefreshAsync()
+		return nil
+	case "add_note":
+		target, err := requireSessionWindow(env)
+		if err != nil {
+			return err
+		}
+		note := firstNonEmpty(env.Note, env.Summary, env.Message)
+		if note == "" {
+			return fmt.Errorf("add_note requires note")
+		}
+		if err := s.addNote(target, note, env.CWD, env.Branch); err != nil {
+			return err
+		}
+		s.broadcastStateAsync()
+		s.statusRefreshAsync()
+		return nil
+	case "delete_note":
+		target, err := requireSessionWindow(env)
+		if err != nil {
+			return err
+		}
+		if err := s.deleteNote(target, env.NoteIndex); err != nil {
+			return err
+		}
+		s.broadcastStateAsync()
+		s.statusRefreshAsync()
+		return nil
 	case "acknowledge":
 		target, err := requireSessionWindow(env)
 		if err != nil {
@@ -317,6 +362,83 @@ func (s *server) updateTaskSummary(target tmuxTarget, summary, cwd, branch strin
 	if t.StartedAt.IsZero() {
 		t.StartedAt = now
 	}
+	return nil
+}
+
+func (s *server) markNeedsConfirmation(target tmuxTarget, summary, cwd, branch string) error {
+	if target.SessionID == "" || target.WindowID == "" {
+		return fmt.Errorf("cannot mark task: missing session or window ID")
+	}
+	target = normalizeTargetNames(target)
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := taskKey(target.SessionID, target.WindowID, target.PaneID)
+	t, ok := s.tasks[key]
+	if !ok {
+		t = &taskRecord{
+			SessionID: target.SessionID, SessionName: strings.TrimSpace(target.SessionName),
+			WindowID: target.WindowID, WindowName: strings.TrimSpace(target.WindowName),
+			Pane: target.PaneID, StartedAt: now, Status: statusNeedsConfirmation, Acknowledged: true,
+		}
+		s.tasks[key] = t
+	}
+	mergeTaskNamesFromTarget(t, target)
+	if strings.TrimSpace(summary) != "" {
+		t.Summary = strings.TrimSpace(summary)
+	}
+	if t.Summary == "" {
+		t.Summary = "Needs user confirmation"
+	}
+	updateTaskContext(t, cwd, branch)
+	t.Status = statusNeedsConfirmation
+	if t.StartedAt.IsZero() {
+		t.StartedAt = now
+	}
+	return nil
+}
+
+func (s *server) addNote(target tmuxTarget, text, cwd, branch string) error {
+	if target.SessionID == "" || target.WindowID == "" {
+		return fmt.Errorf("cannot add note: missing session or window ID")
+	}
+	target = normalizeTargetNames(target)
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := taskKey(target.SessionID, target.WindowID, target.PaneID)
+	t, ok := s.tasks[key]
+	if !ok {
+		t = &taskRecord{
+			SessionID: target.SessionID, SessionName: strings.TrimSpace(target.SessionName),
+			WindowID: target.WindowID, WindowName: strings.TrimSpace(target.WindowName),
+			Pane: target.PaneID, StartedAt: now, Status: statusInProgress, Acknowledged: true,
+		}
+		s.tasks[key] = t
+	}
+	mergeTaskNamesFromTarget(t, target)
+	updateTaskContext(t, cwd, branch)
+	t.Notes = append(t.Notes, noteRecord{Text: strings.TrimSpace(text), CreatedAt: now})
+	return nil
+}
+
+func (s *server) deleteNote(target tmuxTarget, noteIndex *int) error {
+	if target.SessionID == "" || target.WindowID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := taskKey(target.SessionID, target.WindowID, target.PaneID)
+	t, ok := s.tasks[key]
+	if !ok || len(t.Notes) == 0 {
+		return nil
+	}
+	// Default to the last note when no index is given (or it's out of range).
+	idx := len(t.Notes) - 1
+	if noteIndex != nil && *noteIndex >= 0 && *noteIndex < len(t.Notes) {
+		idx = *noteIndex
+	}
+	t.Notes = append(t.Notes[:idx], t.Notes[idx+1:]...)
 	return nil
 }
 
@@ -611,9 +733,21 @@ func (s *server) buildStateEnvelope() *ipc.Envelope {
 		if windowName == "" {
 			windowName = t.WindowID
 		}
+		notes := make([]ipc.Note, 0, len(t.Notes))
+		for _, note := range t.Notes {
+			text := strings.TrimSpace(note.Text)
+			if text == "" {
+				continue
+			}
+			created := ""
+			if !note.CreatedAt.IsZero() {
+				created = note.CreatedAt.Format(time.RFC3339)
+			}
+			notes = append(notes, ipc.Note{Text: text, CreatedAt: created})
+		}
 		tasks = append(tasks, ipc.Task{
 			SessionID: t.SessionID, Session: sessionName, WindowID: t.WindowID,
-			Window: windowName, Pane: t.Pane, Status: t.Status, Summary: t.Summary,
+			Window: windowName, Pane: t.Pane, Status: t.Status, Summary: t.Summary, Notes: notes,
 			CWD: strings.TrimSpace(t.CWD), Branch: strings.TrimSpace(t.Branch),
 			CompletionNote: t.CompletionNote, StartedAt: started, CompletedAt: completed,
 			DurationSeconds: duration.Seconds(), Acknowledged: t.Acknowledged,
@@ -885,16 +1019,18 @@ func firstNonEmpty(values ...string) string {
 }
 
 func stateSummary(tasks []ipc.Task) string {
-	inProgress, waiting := 0, 0
+	inProgress, confirm, waiting := 0, 0, 0
 	for _, t := range tasks {
 		switch t.Status {
 		case statusInProgress:
 			inProgress++
+		case statusNeedsConfirmation:
+			confirm++
 		case statusCompleted:
 			if !t.Acknowledged {
 				waiting++
 			}
 		}
 	}
-	return fmt.Sprintf("Active %d · Waiting %d · %s", inProgress, waiting, time.Now().Format(time.Kitchen))
+	return fmt.Sprintf("Active %d · Confirm %d · Waiting %d · %s", inProgress, confirm, waiting, time.Now().Format(time.Kitchen))
 }
