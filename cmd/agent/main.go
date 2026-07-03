@@ -428,13 +428,55 @@ func (m *model) updateSelKey() {
 	}
 }
 
+func (m model) chromeHeight() int {
+	h := 3 + len(m.footerLines()) + 2
+	if m.closeSelect {
+		h++
+	}
+	if m.tdevMode {
+		h++
+	}
+	return h
+}
+
+func noteBlockHeight(t ipc.Task, noteSelect bool) int {
+	if len(t.Notes) == 0 {
+		return 0
+	}
+	limit := 4
+	lines := limit
+	if len(t.Notes) < limit {
+		lines = len(t.Notes)
+	}
+	if noteSelect {
+		lines++
+	}
+	return lines
+}
+
+func (m model) rowsPerPage() int {
+	avail := m.height - m.chromeHeight()
+	noteExtra := 0
+	if t := m.selected(); t != nil {
+		noteExtra = noteBlockHeight(*t, m.noteSelect)
+	}
+	if avail < 2+noteExtra {
+		return 1
+	}
+	r := (avail - noteExtra) / 2
+	if r < 1 {
+		r = 1
+	}
+	return r
+}
+
 func (m *model) scrollIntoView() {
 	tasks := m.tasks()
 	if len(tasks) == 0 {
 		m.scroll = 0
 		return
 	}
-	rowsPerPage := m.height - 6
+	rowsPerPage := m.rowsPerPage()
 	if rowsPerPage < 1 {
 		rowsPerPage = 1
 	}
@@ -655,7 +697,7 @@ func (m model) renderTasks(width int) string {
 		return styleMuted.Render("No active tasks. Agents will appear here when they report work.")
 	}
 	now := time.Now()
-	rowsPerPage := m.height - 6
+	rowsPerPage := m.rowsPerPage()
 	if rowsPerPage < 1 {
 		rowsPerPage = 1
 	}
