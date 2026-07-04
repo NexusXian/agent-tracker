@@ -34,20 +34,21 @@ type noteRecord struct {
 }
 
 type taskRecord struct {
-	SessionID      string
-	SessionName    string
-	WindowID       string
-	WindowName     string
-	Pane           string
-	Summary        string
-	Notes          []noteRecord
-	CWD            string
-	Branch         string
-	CompletionNote string
-	StartedAt      time.Time
-	CompletedAt    *time.Time
-	Status         string
-	Acknowledged   bool
+	SessionID           string
+	SessionName         string
+	WindowID            string
+	WindowName          string
+	Pane                string
+	Summary             string
+	Notes               []noteRecord
+	ConfirmationOptions []string
+	CWD                 string
+	Branch              string
+	CompletionNote      string
+	StartedAt           time.Time
+	CompletedAt         *time.Time
+	Status              string
+	Acknowledged        bool
 }
 
 type storedSettings struct {
@@ -68,11 +69,18 @@ type uiSubscriber struct {
 	enc *json.Encoder
 }
 
+type confirmationResult struct {
+	Index  int
+	Choice string
+	Err    string
+}
+
 type server struct {
 	mu                   sync.Mutex
 	socketPath           string
 	notificationsEnabled bool
 	tasks                map[string]*taskRecord
+	confirmations        map[string]chan confirmationResult
 	subscribers          map[*uiSubscriber]struct{}
 	settingsPath         string
 }
@@ -82,6 +90,7 @@ func newServer() *server {
 		socketPath:           socketPath(),
 		notificationsEnabled: true,
 		tasks:                make(map[string]*taskRecord),
+		confirmations:        make(map[string]chan confirmationResult),
 		subscribers:          make(map[*uiSubscriber]struct{}),
 		settingsPath:         settingsStorePath(),
 	}
@@ -160,10 +169,22 @@ func (s *server) handleConn(conn net.Conn) {
 		}
 		switch env.Kind {
 		case "command":
-			if err := s.handleCommand(env); err != nil {
-				log.Printf("command error: %v", err)
+			reply := &ipc.Envelope{Kind: "ack"}
+			var err error
+			if env.Command == "needs_confirmation" {
+				reply, err = s.handleNeedsConfirmationCommand(env)
+			} else {
+				err = s.handleCommand(env)
 			}
-			_ = enc.Encode(&ipc.Envelope{Kind: "ack"})
+			if err != nil {
+				log.Printf("command error: %v", err)
+				_ = enc.Encode(&ipc.Envelope{Kind: "error", Message: err.Error()})
+				continue
+			}
+			if reply == nil || reply.Kind == "" {
+				reply = &ipc.Envelope{Kind: "ack"}
+			}
+			_ = enc.Encode(reply)
 		case "ui-register":
 			if sub == nil {
 				sub = &uiSubscriber{enc: enc}
@@ -239,13 +260,15 @@ func (s *server) handleCommand(env ipc.Envelope) error {
 		s.broadcastStateAsync()
 		s.statusRefreshAsync()
 		return nil
-	case "needs_confirmation":
+	case "choose_confirmation":
 		target, err := requireSessionWindow(env)
 		if err != nil {
 			return err
 		}
-		summary := firstNonEmpty(env.Summary, env.Message)
-		if err := s.markNeedsConfirmation(target, summary, env.CWD, env.Branch); err != nil {
+		if env.ConfirmationIndex == nil {
+			return fmt.Errorf("choose_confirmation requires confirmation_index")
+		}
+		if err := s.chooseConfirmation(target, *env.ConfirmationIndex); err != nil {
 			return err
 		}
 		s.broadcastStateAsync()
@@ -315,6 +338,26 @@ func (s *server) handleCommand(env ipc.Envelope) error {
 	}
 }
 
+func (s *server) handleNeedsConfirmationCommand(env ipc.Envelope) (*ipc.Envelope, error) {
+	target, err := requireSessionWindow(env)
+	if err != nil {
+		return nil, err
+	}
+	summary := firstNonEmpty(env.Summary, env.Message)
+	resultCh, err := s.markNeedsConfirmation(target, summary, env.ConfirmationOptions, env.CWD, env.Branch)
+	if err != nil {
+		return nil, err
+	}
+	s.broadcastStateAsync()
+	s.statusRefreshAsync()
+	result := <-resultCh
+	if result.Err != "" {
+		return nil, fmt.Errorf("%s", result.Err)
+	}
+	idx := result.Index
+	return &ipc.Envelope{Kind: "confirmation_result", ConfirmationIndex: &idx, ConfirmationChoice: result.Choice}, nil
+}
+
 func (s *server) startTask(target tmuxTarget, summary, cwd, branch string) error {
 	if target.SessionID == "" || target.WindowID == "" {
 		return fmt.Errorf("cannot create task: missing session or window ID")
@@ -324,6 +367,10 @@ func (s *server) startTask(target tmuxTarget, summary, cwd, branch string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := taskKey(target.SessionID, target.WindowID, target.PaneID)
+	if ch, ok := s.confirmations[key]; ok {
+		delete(s.confirmations, key)
+		ch <- confirmationResult{Err: "confirmation canceled"}
+	}
 	t, ok := s.tasks[key]
 	if !ok {
 		s.tasks[key] = &taskRecord{
@@ -341,6 +388,7 @@ func (s *server) startTask(target tmuxTarget, summary, cwd, branch string) error
 	updateTaskContext(t, cwd, branch)
 	t.StartedAt = now
 	t.Status = statusInProgress
+	t.ConfirmationOptions = nil
 	t.CompletedAt = nil
 	t.CompletionNote = ""
 	t.Acknowledged = true
@@ -377,15 +425,22 @@ func (s *server) updateTaskSummary(target tmuxTarget, summary, cwd, branch strin
 	return nil
 }
 
-func (s *server) markNeedsConfirmation(target tmuxTarget, summary, cwd, branch string) error {
+func (s *server) markNeedsConfirmation(target tmuxTarget, summary string, options []string, cwd, branch string) (chan confirmationResult, error) {
 	if target.SessionID == "" || target.WindowID == "" {
-		return fmt.Errorf("cannot mark task: missing session or window ID")
+		return nil, fmt.Errorf("cannot mark task: missing session or window ID")
+	}
+	options = normalizeConfirmationOptions(options)
+	if len(options) == 0 {
+		return nil, fmt.Errorf("needs_confirmation requires options")
 	}
 	target = normalizeTargetNames(target)
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := taskKey(target.SessionID, target.WindowID, target.PaneID)
+	if _, ok := s.confirmations[key]; ok {
+		return nil, fmt.Errorf("confirmation already pending")
+	}
 	t, ok := s.tasks[key]
 	if !ok {
 		t = &taskRecord{
@@ -404,10 +459,53 @@ func (s *server) markNeedsConfirmation(target tmuxTarget, summary, cwd, branch s
 	}
 	updateTaskContext(t, cwd, branch)
 	t.Status = statusNeedsConfirmation
+	t.ConfirmationOptions = append([]string(nil), options...)
 	if t.StartedAt.IsZero() {
 		t.StartedAt = now
 	}
+	resultCh := make(chan confirmationResult, 1)
+	s.confirmations[key] = resultCh
+	return resultCh, nil
+}
+
+func (s *server) chooseConfirmation(target tmuxTarget, index int) error {
+	if target.SessionID == "" || target.WindowID == "" {
+		return fmt.Errorf("cannot choose confirmation: missing session or window ID")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := taskKey(target.SessionID, target.WindowID, target.PaneID)
+	t, ok := s.tasks[key]
+	if !ok || t.Status != statusNeedsConfirmation {
+		return fmt.Errorf("task is not waiting for confirmation")
+	}
+	if index < 0 || index >= len(t.ConfirmationOptions) {
+		return fmt.Errorf("confirmation_index out of range")
+	}
+	choice := t.ConfirmationOptions[index]
+	ch, ok := s.confirmations[key]
+	if !ok {
+		return fmt.Errorf("confirmation is not pending")
+	}
+	delete(s.confirmations, key)
+	t.Status = statusInProgress
+	t.ConfirmationOptions = nil
+	t.CompletedAt = nil
+	t.CompletionNote = ""
+	t.Acknowledged = true
+	ch <- confirmationResult{Index: index, Choice: choice}
 	return nil
+}
+
+func normalizeConfirmationOptions(options []string) []string {
+	clean := make([]string, 0, len(options))
+	for _, option := range options {
+		option = strings.TrimSpace(option)
+		if option != "" {
+			clean = append(clean, option)
+		}
+	}
+	return clean
 }
 
 func (s *server) addNote(target tmuxTarget, text, cwd, branch string) error {
@@ -482,6 +580,10 @@ func (s *server) finishTask(target tmuxTarget, note, cwd, branch string) (bool, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := taskKey(target.SessionID, target.WindowID, target.PaneID)
+	if ch, ok := s.confirmations[key]; ok {
+		delete(s.confirmations, key)
+		ch <- confirmationResult{Err: "confirmation completed without selection"}
+	}
 	t, ok := s.tasks[key]
 	wasCompleted := false
 	if !ok {
@@ -500,6 +602,7 @@ func (s *server) finishTask(target tmuxTarget, note, cwd, branch string) (bool, 
 	mergeTaskNamesFromTarget(t, target)
 	updateTaskContext(t, cwd, branch)
 	t.Status = statusCompleted
+	t.ConfirmationOptions = nil
 	t.CompletedAt = &now
 	if note != "" {
 		t.CompletionNote = note
@@ -520,7 +623,12 @@ func (s *server) acknowledgeTask(sessionID, windowID, paneID string) error {
 func (s *server) deleteTask(sessionID, windowID, paneID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.tasks, taskKey(sessionID, windowID, paneID))
+	key := taskKey(sessionID, windowID, paneID)
+	if ch, ok := s.confirmations[key]; ok {
+		delete(s.confirmations, key)
+		ch <- confirmationResult{Err: "confirmation task deleted"}
+	}
+	delete(s.tasks, key)
 	return nil
 }
 
@@ -779,7 +887,8 @@ func (s *server) buildStateEnvelope() *ipc.Envelope {
 		tasks = append(tasks, ipc.Task{
 			SessionID: t.SessionID, Session: sessionName, WindowID: t.WindowID,
 			Window: windowName, Pane: t.Pane, Status: t.Status, Summary: t.Summary, Notes: notes,
-			CWD: strings.TrimSpace(t.CWD), Branch: strings.TrimSpace(t.Branch),
+			ConfirmationOptions: append([]string(nil), t.ConfirmationOptions...),
+			CWD:                 strings.TrimSpace(t.CWD), Branch: strings.TrimSpace(t.Branch),
 			CompletionNote: t.CompletionNote, StartedAt: started, CompletedAt: completed,
 			DurationSeconds: duration.Seconds(), Acknowledged: t.Acknowledged,
 		})

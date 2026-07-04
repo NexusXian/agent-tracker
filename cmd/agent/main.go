@@ -119,26 +119,28 @@ type stateMsg struct {
 type cmdResultMsg struct{ err error }
 
 type model struct {
-	keys        keyConfig
-	width       int
-	height      int
-	state       ipc.Envelope
-	cursor      int
-	scroll      int // top row of visible window
-	selKey      string
-	err         string
-	help        bool
-	noteMode    bool
-	noteInput   string
-	noteSelect  bool
-	noteCursor  int
-	closeSelect bool
-	closeCursor int
-	tdevMode    bool
-	tdevKind    string
-	tdevInput   string
-	ctx         tmuxCtx
-	loaded      bool
+	keys          keyConfig
+	width         int
+	height        int
+	state         ipc.Envelope
+	cursor        int
+	scroll        int // top row of visible window
+	selKey        string
+	err           string
+	help          bool
+	noteMode      bool
+	noteInput     string
+	noteSelect    bool
+	noteCursor    int
+	confirmSelect bool
+	confirmCursor int
+	closeSelect   bool
+	closeCursor   int
+	tdevMode      bool
+	tdevKind      string
+	tdevInput     string
+	ctx           tmuxCtx
+	loaded        bool
 }
 
 type tmuxCtx struct {
@@ -203,6 +205,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.tdevMode {
 			return m.handleTdevKey(msg)
 		}
+		if m.confirmSelect {
+			return m.handleConfirmSelectKey(msg.String())
+		}
 		if m.noteMode {
 			return m.handleNoteKey(msg)
 		}
@@ -250,6 +255,11 @@ func (m *model) handleKey(key string) (tea.Model, tea.Cmd) {
 		m.startTdevInput("-c")
 		return m, nil
 	case m.keys.Toggle:
+		if t := m.selected(); t != nil && t.Status == statusNeedsConfirmation && len(t.ConfirmationOptions) > 0 {
+			m.confirmSelect = true
+			m.confirmCursor = 0
+			return m, nil
+		}
 		if m.selected() != nil {
 			m.closeSelect = true
 			m.closeCursor = 0
@@ -374,6 +384,42 @@ func (m *model) handleNoteSelectKey(key string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *model) handleConfirmSelectKey(key string) (tea.Model, tea.Cmd) {
+	t := m.selected()
+	if t == nil || t.Status != statusNeedsConfirmation || len(t.ConfirmationOptions) == 0 {
+		m.confirmSelect = false
+		m.confirmCursor = 0
+		return m, nil
+	}
+	switch key {
+	case m.keys.Cancel, "esc", "q", "ctrl+c":
+		m.confirmSelect = false
+		return m, nil
+	case m.keys.Up, "up":
+		if m.confirmCursor > 0 {
+			m.confirmCursor--
+		}
+		return m, nil
+	case m.keys.Down, "down":
+		if m.confirmCursor < len(t.ConfirmationOptions)-1 {
+			m.confirmCursor++
+		}
+		return m, nil
+	case m.keys.Open, "enter", m.keys.Toggle, "c", " ":
+		idx := m.confirmCursor
+		m.confirmSelect = false
+		return m, m.chooseConfirmationAt(idx)
+	}
+	if len(key) == 1 && key[0] >= '1' && key[0] <= '9' {
+		idx := int(key[0] - '1')
+		if idx < len(t.ConfirmationOptions) {
+			m.confirmSelect = false
+			return m, m.chooseConfirmationAt(idx)
+		}
+	}
+	return m, nil
+}
+
 func (m *model) handleNoteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "ctrl+c":
@@ -454,16 +500,32 @@ func noteBlockHeight(t ipc.Task, noteSelect bool) int {
 	return lines
 }
 
+func confirmationBlockHeight(t ipc.Task, confirmSelect bool) int {
+	if t.Status != statusNeedsConfirmation || len(t.ConfirmationOptions) == 0 {
+		return 0
+	}
+	limit := 9
+	lines := limit
+	if len(t.ConfirmationOptions) < limit {
+		lines = len(t.ConfirmationOptions)
+	}
+	if confirmSelect {
+		lines++
+	}
+	return lines
+}
+
 func (m model) rowsPerPage() int {
 	avail := m.height - m.chromeHeight()
-	noteExtra := 0
+	extra := 0
 	if t := m.selected(); t != nil {
-		noteExtra = noteBlockHeight(*t, m.noteSelect)
+		extra += noteBlockHeight(*t, m.noteSelect)
+		extra += confirmationBlockHeight(*t, m.confirmSelect)
 	}
-	if avail < 2+noteExtra {
+	if avail < 2+extra {
 		return 1
 	}
-	r := (avail - noteExtra) / 2
+	r := (avail - extra) / 2
 	if r < 1 {
 		r = 1
 	}
@@ -500,6 +562,7 @@ func (m *model) clamp() {
 		for i, t := range tasks {
 			if taskKey(t) == m.selKey {
 				m.cursor = i
+				m.clampConfirmCursor(t)
 				m.scrollIntoView()
 				return
 			}
@@ -511,7 +574,27 @@ func (m *model) clamp() {
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
+	if m.cursor >= 0 && m.cursor < len(tasks) {
+		m.clampConfirmCursor(tasks[m.cursor])
+	} else {
+		m.confirmSelect = false
+		m.confirmCursor = 0
+	}
 	m.scrollIntoView()
+}
+
+func (m *model) clampConfirmCursor(t ipc.Task) {
+	if t.Status != statusNeedsConfirmation || len(t.ConfirmationOptions) == 0 {
+		m.confirmSelect = false
+		m.confirmCursor = 0
+		return
+	}
+	if m.confirmCursor >= len(t.ConfirmationOptions) {
+		m.confirmCursor = len(t.ConfirmationOptions) - 1
+	}
+	if m.confirmCursor < 0 {
+		m.confirmCursor = 0
+	}
 }
 
 func (m *model) focusSelected() tea.Cmd {
@@ -603,6 +686,19 @@ func (m *model) toggleNoteAt(index int) tea.Cmd {
 	}
 }
 
+func (m *model) chooseConfirmationAt(index int) tea.Cmd {
+	t := m.selected()
+	if t == nil || index < 0 || index >= len(t.ConfirmationOptions) {
+		return nil
+	}
+	task := *t
+	idx := index
+	return func() tea.Msg {
+		env := ipc.Envelope{SessionID: task.SessionID, WindowID: task.WindowID, Pane: task.Pane, ConfirmationIndex: &idx}
+		return cmdResultMsg{err: sendCommand("choose_confirmation", &env)}
+	}
+}
+
 func (m *model) refreshContext() {
 	ctx := tmuxCtx{}
 	out, err := tmuxOutput("display-message", "-p", "#{session_name}:::#{session_id}:::#{window_name}:::#{window_id}:::#{pane_id}")
@@ -675,11 +771,13 @@ func (m model) metricsLine() string {
 	if msg := strings.TrimSpace(m.state.Message); msg != "" {
 		return msg
 	}
-	active, review := 0, 0
+	active, confirm, review := 0, 0, 0
 	for _, t := range m.state.Tasks {
 		switch t.Status {
 		case statusInProgress:
 			active++
+		case statusNeedsConfirmation:
+			confirm++
 		case statusCompleted:
 			if !t.Acknowledged {
 				review++
@@ -687,8 +785,9 @@ func (m model) metricsLine() string {
 		}
 	}
 	liveDot := styleLive.Render("●")
+	confirmDot := styleConfirm.Render("◆")
 	reviewDot := styleReview.Render("◇")
-	return fmt.Sprintf("%s %d active  ·  %s %d review", liveDot, active, reviewDot, review)
+	return fmt.Sprintf("%s %d active  ·  %s %d confirm  ·  %s %d review", liveDot, active, confirmDot, confirm, reviewDot, review)
 }
 
 func (m model) renderTasks(width int) string {
@@ -766,6 +865,38 @@ func (m model) renderRow(t ipc.Task, selected bool, width int, now time.Time) st
 	}
 	metaLine := renderMetaLine(segs, width-2, selected, styleSelBG)
 	row := " " + indicatorStyle.Render(indicator) + " " + titleStyle.Render(title) + "\n   " + metaLine
+
+	if selected && t.Status == statusNeedsConfirmation && len(t.ConfirmationOptions) > 0 {
+		limit := 9
+		start := 0
+		if m.confirmSelect {
+			start = m.confirmCursor - limit + 1
+			if start < 0 {
+				start = 0
+			}
+		}
+		end := start + limit
+		if end > len(t.ConfirmationOptions) {
+			end = len(t.ConfirmationOptions)
+		}
+		for i := start; i < end; i++ {
+			label := fmt.Sprintf("%d", i+1)
+			if i >= 9 {
+				label = "-"
+			}
+			text := fit("│ "+label+". "+strings.TrimSpace(t.ConfirmationOptions[i]), width-4)
+			style := styleConfirm
+			if m.confirmSelect && i == m.confirmCursor {
+				style = style.Background(lipgloss.Color("94")).Foreground(lipgloss.Color("231"))
+			}
+			row += "\n   " + style.Render(text)
+		}
+		if m.confirmSelect {
+			hint := fmt.Sprintf("option %d/%d  ·  %s/%s move  ·  enter choose  ·  esc cancel",
+				m.confirmCursor+1, len(t.ConfirmationOptions), m.keys.Down, m.keys.Up)
+			row += "\n   " + styleConfirm.Render(fit(hint, width-2))
+		}
+	}
 
 	if selected && len(t.Notes) > 0 {
 		limit := 4
@@ -943,6 +1074,19 @@ func (m model) footerLines() []string {
 		return []string{
 			fmt.Sprintf("Move      │  %s/%s pick note", m.keys.Down, m.keys.Up),
 			"Actions   │  c done  ·  enter delete  ·  esc cancel",
+		}
+	}
+	if m.confirmSelect {
+		return []string{
+			fmt.Sprintf("Confirm   │  %s/%s pick option", m.keys.Down, m.keys.Up),
+			"Actions   │  enter choose  ·  1-9 quick choose  ·  esc cancel",
+		}
+	}
+	if t := m.selected(); t != nil && t.Status == statusNeedsConfirmation && len(t.ConfirmationOptions) > 0 {
+		return []string{
+			fmt.Sprintf("Move      │  %s/%s select  ·  %s open", m.keys.Down, m.keys.Up, m.keys.Open),
+			fmt.Sprintf("Confirm   │  %s choose option", m.keys.Toggle),
+			fmt.Sprintf("System    │  %s delete task  ·  %s refresh  ·  %s quit", m.keys.Delete, m.keys.Refresh, m.keys.Cancel),
 		}
 	}
 	return []string{
@@ -1180,6 +1324,9 @@ func sendCommand(command string, env *ipc.Envelope) error {
 		req.Summary = env.Summary
 		req.Note = env.Note
 		req.NoteIndex = env.NoteIndex
+		req.ConfirmationOptions = env.ConfirmationOptions
+		req.ConfirmationIndex = env.ConfirmationIndex
+		req.ConfirmationChoice = env.ConfirmationChoice
 		req.CWD = env.CWD
 		req.Branch = env.Branch
 	}
@@ -1192,8 +1339,15 @@ func sendCommand(command string, env *ipc.Envelope) error {
 		if err := dec.Decode(&reply); err != nil {
 			return err
 		}
-		if reply.Kind == "ack" {
+		switch reply.Kind {
+		case "ack":
 			return nil
+		case "error":
+			msg := strings.TrimSpace(reply.Message)
+			if msg == "" {
+				msg = "command failed"
+			}
+			return fmt.Errorf("%s", msg)
 		}
 	}
 }
@@ -1370,6 +1524,9 @@ func renderOneShot(env *ipc.Envelope) string {
 			meta += "  " + branch
 		}
 		fmt.Fprintf(&b, "%s [%s] %s  (%s)\n", mark, t.Status, t.Summary, meta)
+		for i, option := range t.ConfirmationOptions {
+			fmt.Fprintf(&b, "  %d. %s\n", i+1, strings.TrimSpace(option))
+		}
 		for _, note := range t.Notes {
 			fmt.Fprintf(&b, "  - %s\n", strings.TrimSpace(note.Text))
 		}

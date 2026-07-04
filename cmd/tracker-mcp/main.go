@@ -35,16 +35,21 @@ func newTrackerClient() *trackerClient {
 }
 
 func (c *trackerClient) sendCommand(ctx context.Context, env ipc.Envelope) error {
+	_, err := c.sendCommandReply(ctx, env, commandTimeout)
+	return err
+}
+
+func (c *trackerClient) sendCommandReply(ctx context.Context, env ipc.Envelope, defaultTimeout time.Duration) (ipc.Envelope, error) {
 	env.Kind = "command"
 	d := net.Dialer{}
-	if _, ok := ctx.Deadline(); !ok {
+	if _, ok := ctx.Deadline(); !ok && defaultTimeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, commandTimeout)
+		ctx, cancel = context.WithTimeout(ctx, defaultTimeout)
 		defer cancel()
 	}
 	conn, err := d.DialContext(ctx, "unix", c.socket)
 	if err != nil {
-		return err
+		return ipc.Envelope{}, err
 	}
 	defer conn.Close()
 	if deadline, ok := ctx.Deadline(); ok {
@@ -53,15 +58,22 @@ func (c *trackerClient) sendCommand(ctx context.Context, env ipc.Envelope) error
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
 	if err := enc.Encode(&env); err != nil {
-		return err
+		return ipc.Envelope{}, err
 	}
 	for {
 		var reply ipc.Envelope
 		if err := dec.Decode(&reply); err != nil {
-			return err
+			return ipc.Envelope{}, err
 		}
-		if reply.Kind == "ack" {
-			return nil
+		switch reply.Kind {
+		case "ack", "confirmation_result":
+			return reply, nil
+		case "error":
+			msg := strings.TrimSpace(reply.Message)
+			if msg == "" {
+				msg = "command failed"
+			}
+			return ipc.Envelope{}, fmt.Errorf("%s", msg)
 		}
 	}
 }
@@ -88,10 +100,11 @@ type updateInput struct {
 }
 
 type confirmationInput struct {
-	Summary string `json:"summary,omitempty"`
-	TmuxID  string `json:"tmux_id"`
-	CWD     string `json:"cwd,omitempty"`
-	Branch  string `json:"branch,omitempty"`
+	Summary string   `json:"summary,omitempty"`
+	Options []string `json:"options"`
+	TmuxID  string   `json:"tmux_id"`
+	CWD     string   `json:"cwd,omitempty"`
+	Branch  string   `json:"branch,omitempty"`
 }
 
 type noteInput struct {
@@ -104,6 +117,17 @@ type noteInput struct {
 type deleteNoteInput struct {
 	TmuxID    string `json:"tmux_id"`
 	NoteIndex *int   `json:"note_index,omitempty"`
+}
+
+func normalizeConfirmationOptions(options []string) []string {
+	clean := make([]string, 0, len(options))
+	for _, option := range options {
+		option = strings.TrimSpace(option)
+		if option != "" {
+			clean = append(clean, option)
+		}
+	}
+	return clean
 }
 
 func main() {
@@ -175,19 +199,34 @@ func main() {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "needs_confirmation",
-		Description: "Mark the task for a tmux session/window/pane as waiting for user confirmation.",
+		Description: "Ask the user to choose one confirmation option for a tmux session/window/pane, then return the selected option.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input confirmationInput) (*mcp.CallToolResult, any, error) {
 		target, err := parseTmuxID(input.TmuxID)
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := client.sendCommand(ctx, ipc.Envelope{
+		options := normalizeConfirmationOptions(input.Options)
+		if len(options) == 0 {
+			return nil, nil, fmt.Errorf("options are required")
+		}
+		reply, err := client.sendCommandReply(ctx, ipc.Envelope{
 			Command: "needs_confirmation", SessionID: target.SessionID, WindowID: target.WindowID,
-			Pane: target.PaneID, Summary: input.Summary, CWD: input.CWD, Branch: input.Branch,
-		}); err != nil {
+			Pane: target.PaneID, Summary: input.Summary, ConfirmationOptions: options, CWD: input.CWD, Branch: input.Branch,
+		}, 0)
+		if err != nil {
 			return nil, nil, err
 		}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Task marked as needing confirmation."}}}, nil, nil
+		if reply.ConfirmationIndex == nil {
+			return nil, nil, fmt.Errorf("confirmation result missing selected index")
+		}
+		payload, err := json.Marshal(map[string]any{
+			"selected_index":  *reply.ConfirmationIndex,
+			"selected_option": reply.ConfirmationChoice,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(payload)}}}, nil, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
