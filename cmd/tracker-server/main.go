@@ -45,6 +45,7 @@ type taskRecord struct {
 	CWD                 string
 	Branch              string
 	CompletionNote      string
+	Phase               string
 	StartedAt           time.Time
 	CompletedAt         *time.Time
 	Status              string
@@ -227,7 +228,23 @@ func (s *server) handleCommand(env ipc.Envelope) error {
 			return err
 		}
 		if notify && s.notificationsAreEnabled() {
-			go s.notifyResponded(target)
+			inputs := append([]string(nil), env.Inputs...)
+			go s.notifyResponded(target, inputs)
+		}
+		s.broadcastStateAsync()
+		s.statusRefreshAsync()
+		return nil
+	case "update_phase":
+		target, err := requireSessionWindow(env)
+		if err != nil {
+			return err
+		}
+		phase := strings.TrimSpace(env.Phase)
+		if phase == "" {
+			return fmt.Errorf("update_phase requires phase")
+		}
+		if err := s.updatePhase(target, phase, env.CWD, env.Branch); err != nil {
+			return err
 		}
 		s.broadcastStateAsync()
 		s.statusRefreshAsync()
@@ -242,7 +259,7 @@ func (s *server) handleCommand(env ipc.Envelope) error {
 			return fmt.Errorf("notify requires summary")
 		}
 		if s.notificationsAreEnabled() {
-			return sendSystemNotification(notificationTitleForTarget(target), message, notificationActionForTarget(target))
+			return sendSystemNotification(notificationTitleForTarget(target), message, notificationActionForTarget(target), "")
 		}
 		return nil
 	case "update_task":
@@ -391,6 +408,7 @@ func (s *server) startTask(target tmuxTarget, summary, cwd, branch string) error
 	t.ConfirmationOptions = nil
 	t.CompletedAt = nil
 	t.CompletionNote = ""
+	t.Phase = ""
 	t.Acknowledged = true
 	return nil
 }
@@ -421,6 +439,22 @@ func (s *server) updateTaskSummary(target tmuxTarget, summary, cwd, branch strin
 	}
 	if t.StartedAt.IsZero() {
 		t.StartedAt = now
+	}
+	return nil
+}
+
+func (s *server) updatePhase(target tmuxTarget, phase, cwd, branch string) error {
+	if target.SessionID == "" || target.WindowID == "" {
+		return fmt.Errorf("cannot update phase: missing session or window ID")
+	}
+	target = normalizeTargetNames(target)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := taskKey(target.SessionID, target.WindowID, target.PaneID)
+	if t, ok := s.tasks[key]; ok {
+		t.Phase = phase
+		mergeTaskNamesFromTarget(t, target)
+		updateTaskContext(t, cwd, branch)
 	}
 	return nil
 }
@@ -604,6 +638,7 @@ func (s *server) finishTask(target tmuxTarget, note, cwd, branch string) (bool, 
 	t.Status = statusCompleted
 	t.ConfirmationOptions = nil
 	t.CompletedAt = &now
+	t.Phase = ""
 	if note != "" {
 		t.CompletionNote = note
 	}
@@ -692,15 +727,50 @@ func (s *server) notificationsAreEnabled() bool {
 	return s.notificationsEnabled
 }
 
-func (s *server) notifyResponded(target tmuxTarget) {
+func (s *server) notifyResponded(target tmuxTarget, inputs []string) {
 	target = s.fillTargetNamesFromTask(target)
 	summary := strings.TrimSpace(s.summaryForTask(target.SessionID, target.WindowID, target.PaneID))
 	if summary == "" {
 		summary = "Task marked complete"
 	}
-	if err := sendSystemNotification(notificationTitleForTarget(target), summary, notificationActionForTarget(target)); err != nil {
+	message := notificationMessageFromInputs(inputs)
+	if message == "" {
+		message = summary
+	}
+	s.persistLatestNotified(target)
+	if err := sendSystemNotification(notificationTitleForTarget(target), message, notificationActionForTarget(target), summary); err != nil {
 		log.Printf("notification error: %v", err)
 	}
+}
+
+func notificationMessageFromInputs(inputs []string) string {
+	lines := make([]string, 0, len(inputs))
+	for _, input := range inputs {
+		if line := strings.TrimSpace(input); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (s *server) persistLatestNotified(target tmuxTarget) {
+	session := strings.TrimSpace(target.SessionID)
+	window := strings.TrimSpace(target.WindowID)
+	pane := strings.TrimSpace(target.PaneID)
+	if session == "" || window == "" || pane == "" {
+		return
+	}
+	dir := filepath.Join(os.Getenv("HOME"), ".config", "agent-tracker", "run")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	final := filepath.Join(dir, "latest_notified.txt")
+	tmp := final + ".tmp"
+	content := session + ":::" + window + ":::" + pane + "\n"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, final)
 }
 
 func (s *server) fillTargetNamesFromTask(target tmuxTarget) tmuxTarget {
@@ -889,7 +959,7 @@ func (s *server) buildStateEnvelope() *ipc.Envelope {
 			Window: windowName, Pane: t.Pane, Status: t.Status, Summary: t.Summary, Notes: notes,
 			ConfirmationOptions: append([]string(nil), t.ConfirmationOptions...),
 			CWD:                 strings.TrimSpace(t.CWD), Branch: strings.TrimSpace(t.Branch),
-			CompletionNote: t.CompletionNote, StartedAt: started, CompletedAt: completed,
+			CompletionNote: t.CompletionNote, Phase: strings.TrimSpace(t.Phase), StartedAt: started, CompletedAt: completed,
 			DurationSeconds: duration.Seconds(), Acknowledged: t.Acknowledged,
 		})
 	}
@@ -932,7 +1002,7 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-func sendSystemNotification(title, message string, action *notificationAction) error {
+func sendSystemNotification(title, message string, action *notificationAction, subtitle string) error {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		title = "Tracker"
@@ -941,10 +1011,14 @@ func sendSystemNotification(title, message string, action *notificationAction) e
 	if message == "" {
 		message = title
 	}
+	subtitle = strings.TrimSpace(subtitle)
 	switch runtime.GOOS {
 	case "darwin":
 		if bin, err := exec.LookPath("terminal-notifier"); err == nil {
-			args := []string{"-title", title, "-message", message, "-group", "agent-tracker"}
+			args := []string{"-title", title, "-message", message, "-sound", "Blow", "-ignoreDnD", "-group", "agent-tracker"}
+			if subtitle != "" {
+				args = append(args, "-subtitle", subtitle)
+			}
 			if action != nil {
 				if strings.TrimSpace(action.Command) != "" {
 					args = append(args, "-execute", action.Command)

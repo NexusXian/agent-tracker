@@ -197,7 +197,9 @@ Line-delimited JSON over the Unix socket. Messages use the `ipc.Envelope` shape:
 { "kind": "ack" }
 ```
 
-Commands: `start_task`, `finish_task`, `update_task`, `acknowledge`, `delete_task`, `notify`.
+Commands: `start_task`, `finish_task`, `update_task`, `update_phase`, `acknowledge`, `delete_task`, `notify`.
+
+`update_phase` sets a task's live phase (`waiting` / `tool` / `question` / `responding`); the TUI shows it next to the task. `finish_task` accepts an optional `inputs` array (recent user messages) used as the desktop notification body; the notification also persists `~/.config/agent-tracker/run/latest_notified.txt` for jump-to-latest scripts.
 
 ## Files
 

@@ -99,6 +99,13 @@ type updateInput struct {
 	Branch  string `json:"branch,omitempty"`
 }
 
+type phaseInput struct {
+	Phase   string `json:"phase"`
+	TmuxID  string `json:"tmux_id"`
+	CWD     string `json:"cwd,omitempty"`
+	Branch  string `json:"branch,omitempty"`
+}
+
 type confirmationInput struct {
 	Summary string   `json:"summary,omitempty"`
 	Options []string `json:"options"`
@@ -195,6 +202,27 @@ func main() {
 			return nil, nil, err
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Task updated."}}}, nil, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "update_phase",
+		Description: "Update the current working phase of an in-progress task (waiting, tool, question, responding) for a tmux session/window/pane.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, input phaseInput) (*mcp.CallToolResult, any, error) {
+		target, err := parseTmuxID(input.TmuxID)
+		if err != nil {
+			return nil, nil, err
+		}
+		phase := strings.TrimSpace(input.Phase)
+		if phase == "" {
+			return nil, nil, fmt.Errorf("phase is required")
+		}
+		if err := client.sendCommand(ctx, ipc.Envelope{
+			Command: "update_phase", SessionID: target.SessionID, WindowID: target.WindowID,
+			Pane: target.PaneID, Phase: phase, CWD: input.CWD, Branch: input.Branch,
+		}); err != nil {
+			return nil, nil, err
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "Phase updated."}}}, nil, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{

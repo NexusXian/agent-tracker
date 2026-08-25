@@ -18,6 +18,8 @@ type Envelope struct {
 	ConfirmationChoice  string   `json:"confirmation_choice,omitempty"`
 	CWD                 string   `json:"cwd,omitempty"`
 	Branch              string   `json:"branch,omitempty"`
+	Phase               string   `json:"phase,omitempty"`
+	Inputs              []string `json:"inputs,omitempty"`
 	Tasks               []Task   `json:"tasks,omitempty"`
 }
 
@@ -40,6 +42,7 @@ type Task struct {
 	CWD                 string   `json:"cwd,omitempty"`
 	Branch              string   `json:"branch,omitempty"`
 	CompletionNote      string   `json:"completion_note,omitempty"`
+	Phase               string   `json:"phase,omitempty"`
 	StartedAt           string   `json:"started_at,omitempty"`
 	CompletedAt         string   `json:"completed_at,omitempty"`
 	DurationSeconds     float64  `json:"duration_seconds"`

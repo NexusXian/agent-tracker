@@ -860,6 +860,11 @@ func (m model) renderRow(t ipc.Task, selected bool, width int, now time.Time) st
 	if t.Status == statusNeedsConfirmation {
 		segs = append(segs, sep("  ·  ◆ confirm"))
 	}
+	if t.Status == statusInProgress {
+		if phaseText, phaseStyle := phaseDisplay(strings.TrimSpace(t.Phase)); phaseText != "" {
+			segs = append(segs, metaSegment{text: "  ·  ", style: styleMeta}, metaSegment{text: phaseText, style: phaseStyle})
+		}
+	}
 	if d := liveDuration(t, now); d != "" {
 		segs = append(segs, sep("  ·  "), metaSegment{text: "◷ " + d, style: styleMeta})
 	}
@@ -1180,6 +1185,21 @@ func taskIndicator(t ipc.Task, now time.Time) string {
 		return "◇"
 	}
 	return "•"
+}
+
+func phaseDisplay(phase string) (string, lipgloss.Style) {
+	switch phase {
+	case "waiting":
+		return "… waiting for response", styleMeta
+	case "responding":
+		return "✎ responding", lipgloss.NewStyle().Foreground(lipgloss.Color("79"))
+	case "tool":
+		return "⚙ running tool", lipgloss.NewStyle().Foreground(lipgloss.Color("221"))
+	case "question":
+		return "? awaiting answer", lipgloss.NewStyle().Foreground(lipgloss.Color("221"))
+	default:
+		return "", lipgloss.Style{}
+	}
 }
 
 func liveDuration(t ipc.Task, now time.Time) string {
