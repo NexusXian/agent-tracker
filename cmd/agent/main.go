@@ -116,7 +116,10 @@ type stateMsg struct {
 	env *ipc.Envelope
 	err error
 }
-type cmdResultMsg struct{ err error }
+type cmdResultMsg struct {
+	err  error
+	quit bool
+}
 
 type model struct {
 	keys          keyConfig
@@ -199,6 +202,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case cmdResultMsg:
 		if msg.err != nil {
 			m.err = msg.err.Error()
+		} else if msg.quit {
+			return m, tea.Quit
 		}
 		return m, poll()
 	case tea.KeyMsg:
@@ -604,10 +609,7 @@ func (m *model) focusSelected() tea.Cmd {
 	}
 	return func() tea.Msg {
 		err := focusTask(*t)
-		if err != nil {
-			return cmdResultMsg{err: err}
-		}
-		return cmdResultMsg{}
+		return cmdResultMsg{err: err, quit: err == nil && os.Getenv("AGENT_TRACKER_POPUP") == "1"}
 	}
 }
 
@@ -1376,6 +1378,20 @@ func focusTask(t ipc.Task) error {
 	if strings.TrimSpace(t.SessionID) == "" {
 		return fmt.Errorf("session required to focus task")
 	}
+	pane := strings.TrimSpace(t.Pane)
+	helper := filepath.Join(os.Getenv("HOME"), ".config", "tmux", "scripts", "agent_popup.py")
+	if info, err := os.Stat(helper); err == nil && info.Mode().IsRegular() && pane != "" {
+		if os.Getenv("AGENT_TRACKER_POPUP") == "1" || popupSessionForPane(pane) != "" {
+			args := []string{"python3", helper, "focus", "--pane", pane}
+			if client := strings.TrimSpace(os.Getenv("AGENT_TRACKER_CLIENT")); client != "" {
+				args = append(args, "--client", client)
+			}
+			for i := range args {
+				args[i] = shellQuote(args[i])
+			}
+			return runTmux("run-shell", "-b", strings.Join(args, " "))
+		}
+	}
 	if err := runTmux("switch-client", "-t", strings.TrimSpace(t.SessionID)); err != nil {
 		return err
 	}
@@ -1390,6 +1406,33 @@ func focusTask(t ipc.Task) error {
 		}
 	}
 	return nil
+}
+
+func popupSessionForPane(pane string) string {
+	if strings.TrimSpace(pane) == "" {
+		return ""
+	}
+	out, err := tmuxOutput("display-message", "-p", "-t", pane, "#{session_id}")
+	if err != nil {
+		return ""
+	}
+	session := strings.TrimSpace(out)
+	if session != "" && tmuxSessionOption(session, "@agent_popup") == "1" {
+		return session
+	}
+	return ""
+}
+
+func tmuxSessionOption(session, name string) string {
+	out, err := tmuxOutput("show-options", "-qv", "-t", session, name)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func runTmux(args ...string) error {

@@ -367,6 +367,9 @@ func (s *server) handleNeedsConfirmationCommand(env ipc.Envelope) (*ipc.Envelope
 	}
 	s.broadcastStateAsync()
 	s.statusRefreshAsync()
+	if resultCh == nil {
+		return &ipc.Envelope{Kind: "ack"}, nil
+	}
 	result := <-resultCh
 	if result.Err != "" {
 		return nil, fmt.Errorf("%s", result.Err)
@@ -434,6 +437,11 @@ func (s *server) updateTaskSummary(target tmuxTarget, summary, cwd, branch strin
 	mergeTaskNamesFromTarget(t, target)
 	t.Summary = summary
 	updateTaskContext(t, cwd, branch)
+	_, pending := s.confirmations[key]
+	if t.Status == statusNeedsConfirmation && len(t.ConfirmationOptions) == 0 && !pending {
+		t.Status = statusInProgress
+		t.ConfirmationOptions = nil
+	}
 	if t.Status == "" {
 		t.Status = statusInProgress
 	}
@@ -455,6 +463,11 @@ func (s *server) updatePhase(target tmuxTarget, phase, cwd, branch string) error
 		t.Phase = phase
 		mergeTaskNamesFromTarget(t, target)
 		updateTaskContext(t, cwd, branch)
+		_, pending := s.confirmations[key]
+		if strings.TrimSpace(phase) != "question" && t.Status == statusNeedsConfirmation && len(t.ConfirmationOptions) == 0 && !pending {
+			t.Status = statusInProgress
+			t.ConfirmationOptions = nil
+		}
 	}
 	return nil
 }
@@ -464,9 +477,6 @@ func (s *server) markNeedsConfirmation(target tmuxTarget, summary string, option
 		return nil, fmt.Errorf("cannot mark task: missing session or window ID")
 	}
 	options = normalizeConfirmationOptions(options)
-	if len(options) == 0 {
-		return nil, fmt.Errorf("needs_confirmation requires options")
-	}
 	target = normalizeTargetNames(target)
 	now := time.Now()
 	s.mu.Lock()
@@ -496,6 +506,9 @@ func (s *server) markNeedsConfirmation(target tmuxTarget, summary string, option
 	t.ConfirmationOptions = append([]string(nil), options...)
 	if t.StartedAt.IsZero() {
 		t.StartedAt = now
+	}
+	if len(options) == 0 {
+		return nil, nil
 	}
 	resultCh := make(chan confirmationResult, 1)
 	s.confirmations[key] = resultCh
@@ -798,6 +811,7 @@ func notificationTitleForTarget(target tmuxTarget) string {
 	if window == "" {
 		window = strings.TrimSpace(target.WindowID)
 	}
+	session, window = popupDisplayNames(target.PaneID, session, window)
 	if session != "" && window != "" {
 		return session + " - " + window
 	}
@@ -942,6 +956,7 @@ func (s *server) buildStateEnvelope() *ipc.Envelope {
 		if windowName == "" {
 			windowName = t.WindowID
 		}
+		sessionName, windowName = popupDisplayNames(t.Pane, sessionName, windowName)
 		notes := make([]ipc.Note, 0, len(t.Notes))
 		for _, note := range t.Notes {
 			text := strings.TrimSpace(note.Text)
@@ -992,7 +1007,55 @@ func notificationActionForTarget(target tmuxTarget) *notificationAction {
 	}
 	cmd := fmt.Sprintf("tmux switch-client -t %s && tmux select-window -t %s && tmux select-pane -t %s",
 		shellQuote(session), shellQuote(window), shellQuote(pane))
-	return &notificationAction{Command: "sh -lc " + strconv.Quote(cmd), ActivateApp: "com.googlecode.iterm2"}
+	command := "sh -lc " + strconv.Quote(cmd)
+	helper := filepath.Join(os.Getenv("HOME"), ".config", "tmux", "scripts", "agent_popup.py")
+	if info, err := os.Stat(helper); err == nil && info.Mode().IsRegular() && popupSessionForPane(pane) != "" {
+		args := []string{"python3", helper, "focus", "--pane", pane}
+		for i := range args {
+			args[i] = shellQuote(args[i])
+		}
+		cmd = "tmux run-shell -b " + shellQuote(strings.Join(args, " "))
+		command = "sh -lc " + shellQuote(cmd)
+	}
+	return &notificationAction{Command: command, ActivateApp: "com.googlecode.iterm2"}
+}
+
+func popupSessionForPane(pane string) string {
+	if strings.TrimSpace(pane) == "" {
+		return ""
+	}
+	session, err := tmuxQuery(pane, "#{session_id}")
+	if err != nil || session == "" {
+		return ""
+	}
+	if tmuxSessionOption(session, "@agent_popup") == "1" {
+		return session
+	}
+	return ""
+}
+
+func tmuxSessionOption(session, name string) string {
+	out, err := exec.Command("tmux", "show-options", "-qv", "-t", session, name).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func popupDisplayNames(pane, sessionName, windowName string) (string, string) {
+	session := popupSessionForPane(pane)
+	if session == "" {
+		return sessionName, windowName
+	}
+	tool := firstNonEmpty(tmuxSessionOption(session, "@agent_popup_tool"), "agent")
+	if owner := tmuxSessionOption(session, "@agent_popup_owner"); owner != "" {
+		if origin, err := detectTmuxTarget(owner); err == nil {
+			sessionName = firstNonEmpty(origin.SessionName, sessionName)
+			windowName = firstNonEmpty(origin.WindowName, windowName)
+			windowName += " · pane " + origin.PaneIndex
+		}
+	}
+	return sessionName, windowName + " / " + tool + " · popup"
 }
 
 func shellQuote(value string) string {
